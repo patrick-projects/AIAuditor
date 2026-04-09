@@ -2,6 +2,8 @@ target/
 *.class
 *.jar
 !.mvn/wrapper/maven-wrapper.jar
+# Shipped extension build (see releases/README)
+!releases/*.jar
 .DS_Store
 .idea/
 *.iml
