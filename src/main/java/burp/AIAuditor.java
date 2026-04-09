@@ -1462,6 +1462,16 @@ private void createMainTab() {
                 aiAuditorMenu.add(scanMultiple);
             }
         }
+
+        List<AuditIssue> selectedIssues = getSelectedIssuesFromContextMenu(event);
+        if (!selectedIssues.isEmpty()) {
+            List<AuditIssue> issuesCopy = new ArrayList<>(selectedIssues);
+            JMenuItem deepDive = new JMenuItem(selectedIssues.size() == 1
+                    ? "Deep-dive this Scanner issue (LLM)"
+                    : String.format("Deep-dive %d Scanner issues (LLM)", selectedIssues.size()));
+            deepDive.addActionListener(e -> handleScannerIssuesDeepDive(issuesCopy));
+            aiAuditorMenu.add(deepDive);
+        }
         
         // Only add the AI Auditor menu if it has sub-items
         if (aiAuditorMenu.getMenuComponentCount() > 0) {
@@ -1469,6 +1479,65 @@ private void createMainTab() {
         }
 
         return menuItems;
+    }
+
+    /**
+     * Burp still exposes scanner-issue context through {@link ContextMenuEvent#selectedIssues()} (deprecated but
+     * functional). Used for one-click deep-dive from issues raised by extensions such as HTTP Request Smuggler.
+     */
+    @SuppressWarnings("deprecation")
+    private static List<AuditIssue> getSelectedIssuesFromContextMenu(ContextMenuEvent event) {
+        List<AuditIssue> issues = event.selectedIssues();
+        return issues != null ? issues : Collections.emptyList();
+    }
+
+    private String buildScannerIssueDeepDivePreamble(AuditIssue issue) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CONTEXT: Burp (or another extension such as HTTP Request Smuggler) already reported an issue below.\n");
+        sb.append("Analyze in light of that finding. Summarize impact in plain language; say whether the evidence supports ");
+        sb.append("a real vulnerability (e.g. desync / smuggling / cache poisoning) versus a false positive; ");
+        sb.append("give concrete verification steps in Burp Repeater and what to log or compare; ");
+        sb.append("note parser differential or tunneling angles when relevant.\n");
+        sb.append("Use the JSON findings structure from the main instructions for any distinct NEW issues you add; ");
+        sb.append("you may reference the existing Burp issue in explanations.\n\n");
+        sb.append("=== EXISTING BURP ISSUE ===\n");
+        sb.append("Name: ").append(issue.name()).append("\n");
+        sb.append("Severity: ").append(issue.severity()).append("\n");
+        sb.append("Confidence: ").append(issue.confidence()).append("\n");
+        String rem = issue.remediation();
+        if (rem != null && !rem.isEmpty()) {
+            sb.append("Remediation: ").append(rem).append("\n");
+        }
+        sb.append("Detail:\n").append(issue.detail()).append("\n");
+        return sb.toString();
+    }
+
+    private void handleScannerIssuesDeepDive(List<AuditIssue> issues) {
+        if (issues == null || issues.isEmpty()) {
+            return;
+        }
+        int queued = 0;
+        for (AuditIssue issue : issues) {
+            String preamble = buildScannerIssueDeepDivePreamble(issue);
+            List<HttpRequestResponse> rrs = issue.requestResponses();
+            if (rrs == null || rrs.isEmpty()) {
+                log("Deep-dive: issue \"" + issue.name() + "\" has no linked HTTP messages; skip or open the issue in the editor.",
+                        LogCategory.GENERAL);
+                continue;
+            }
+            for (HttpRequestResponse rr : rrs) {
+                if (rr != null && rr.request() != null) {
+                    processAuditRequest(rr, null, false, preamble);
+                    queued++;
+                }
+            }
+        }
+        if (queued == 0) {
+            api.logging().raiseInfoEvent(
+                    "AI Auditor: Selected issue(s) have no linked HTTP traffic. Open the request in Proxy/Logger and use Scan Request/Response, or pick an issue that includes stored requests.");
+        } else {
+            log("Deep-dive queued " + queued + " AI audit run(s) for Scanner issue(s).", LogCategory.GENERAL);
+        }
     }
 
     private void handleExplainMeThis(MessageEditorHttpRequestResponse editor) {
@@ -1598,7 +1667,7 @@ private void createMainTab() {
         for (HttpRequestResponse reqRes : requests) {
             if (reqRes != null && reqRes.request() != null) {
                 futures.add(CompletableFuture.runAsync(() -> {
-                    processAuditRequest(reqRes, null, false);
+                    processAuditRequest(reqRes, null, false, null);
                 }, batchExecutor));
             }
         }
@@ -1609,8 +1678,15 @@ private void createMainTab() {
     }
 
     private void processAuditRequest(HttpRequestResponse reqRes, String selectedContent, boolean isSelectedPortion) {
+        processAuditRequest(reqRes, selectedContent, isSelectedPortion, null);
+    }
+
+    private void processAuditRequest(HttpRequestResponse reqRes, String selectedContent, boolean isSelectedPortion,
+            String trafficContextPreamble) {
 		// TEMP: prints full stack trace to Extender > Errors
         // Thread.dumpStack();   
+
+        final String preamble = trafficContextPreamble;
 
 		String selectedModel = getSelectedModel();
         String[] modelParts = selectedModel.split("/",2);
@@ -1677,6 +1753,9 @@ private void createMainTab() {
                     request = reqRes.request().toString();
                     response = reqRes.response() != null ? reqRes.response().toString() : "";
                     contentToChunk = request + "\n\n" + response;
+                }
+                if (preamble != null && !preamble.isEmpty()) {
+                    contentToChunk = preamble + "\n\n=== HTTP traffic (request then response) ===\n\n" + contentToChunk;
                 }
 
                 log(String.format("processAuditRequest - Request length: %d, Response length: %d, Combined contentToChunk length: %d",
