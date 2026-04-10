@@ -84,6 +84,12 @@ import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.core.ToolType;
+import burp.api.montoya.http.HttpService;
+import burp.api.montoya.http.handler.HttpHandler;
+import burp.api.montoya.http.handler.HttpRequestToBeSent;
+import burp.api.montoya.http.handler.HttpResponseReceived;
+import burp.api.montoya.http.handler.RequestToBeSentAction;
+import burp.api.montoya.http.handler.ResponseReceivedAction;
 import burp.api.montoya.http.message.StatusCodeClass;
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
@@ -105,7 +111,7 @@ import burp.api.montoya.ui.editor.HttpResponseEditor;
 import javax.swing.*;
 import java.awt.*;
  
-public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanCheck {
+public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanCheck, HttpHandler {
     private static final String EXTENSION_NAME = "AI Auditor";
 
 	 private int maxRetries;
@@ -122,6 +128,23 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     private static final int PASSIVE_AUDIT_DEDUP_MAX_KEYS = 8000;
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
+
+    private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP = "<html><body style='width:380px'>"
+            + "Queues the same AI audit as manual scan, but only for messages sent through Burp’s <b>Proxy</b> "
+            + "(normal browser pace). Skips Scanner/crawler volume. "
+            + "You must select a <b>local/…</b> model and set <b>Local LLM Endpoint</b> below (LM Studio). "
+            + "On Apple Silicon, <b>Google Gemma 3</b> or newer (incl. Gemma 4 when published) as a GGUF chat model is a strong default."
+            + "</body></html>";
+
+    private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
+            "Local LLM quick setup (browser traffic via Proxy):\n\n"
+            + "1) Install LM Studio (lmstudio.ai), open the Search tab, download a small instruction-tuned GGUF "
+            + "(Google Gemma 3 / Gemma 2 / future Gemma 4-class models work well on M-series Macs).\n"
+            + "2) Load the model, open the Local Server tab, Start Server — note the URL (often http://127.0.0.1:1234/v1).\n"
+            + "3) Paste that URL into \"Local LLM Endpoint\" on the left, set AI Model to local/local-llm or your loaded id, Save.\n"
+            + "4) Enable \"Auto-audit browser (Proxy) → local LLM\" below. Browse through Burp; only Proxy traffic is analyzed.\n"
+            + "5) Optional: point Burp’s proxy at 127.0.0.1:8080 and this extension at the LM Studio URL — "
+            + "requests to the LM host are skipped to avoid feedback loops.\n";
      
      private MontoyaApi api;
      private PersistedObject persistedData;
@@ -144,9 +167,12 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private JTextField filterModelsField;
      private JTextArea promptTemplateArea;
      private JTextArea explainMeThisPromptArea; // New field for Explain Me This custom prompt
+     private JTextArea pocPromptArea;
      private JButton saveButton;
-     private Registration menuRegistration;
-     private Registration scanCheckRegistration;
+    private Registration menuRegistration;
+    private Registration scanCheckRegistration;
+    private Registration auditIssueHandlerRegistration;
+    private Registration httpHandlerRegistration;
      private JTextField proxyField;
 	 private JLabel activeTasksLabel;
 	 private JLabel queuedTasksLabel;
@@ -175,13 +201,22 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private String cachedDefaultXai = "xai/grok-4-1-fast-non-reasoning";
     private String cachedDefaultLocal = "local/local-llm (LM Studio)";
 
-    private JCheckBox passiveAiEnabledCheckbox;
+    private JCheckBox passiveAiOnScannerIssuesCheckbox;
+    private JCheckBox passiveAiAllTrafficCheckbox;
+    private JCheckBox proxyBrowserLocalAiCheckbox;
     private JCheckBox passiveAiInScopeCheckbox;
     private JTextField passiveMaxBodyKbField;
-    private volatile boolean passiveAiScannerEnabled;
+    /** When true, queue LLM audit only when Burp reports a Scanner issue (not from this extension). */
+    private volatile boolean passiveAiOnScannerIssues = true;
+    /** When true, also queue on every qualifying passive scan hit (high token use). */
+    private volatile boolean passiveAiAuditAllTraffic = false;
+    /** Proxy-originated browser traffic → LLM when local model is configured. */
+    private volatile boolean proxyBrowserLocalAiEnabled = true;
     private volatile boolean passiveAiInScopeOnly = true;
     private volatile int passiveMaxResponseBytes = DEFAULT_PASSIVE_MAX_BODY_KB * 1024;
     private final Set<String> passiveAuditDedupKeys = ConcurrentHashMap.newKeySet();
+    private final Set<String> scannerIssueAuditDedupKeys = ConcurrentHashMap.newKeySet();
+    private final Set<String> proxyBrowserAiDedupKeys = ConcurrentHashMap.newKeySet();
 
 	private JRadioButton detailedLoggingRadio;
 	private JRadioButton detailedOnelinerLoggingRadio;
@@ -387,8 +422,14 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
         
         // Register extension capabilities
         api.extension().setName(EXTENSION_NAME);
+        migratePassiveAiPreferencesIfNeeded();
+        syncPassiveAiFlagsFromPreferences();
+        migrateProxyBrowserLocalAiPreferenceIfNeeded();
+        syncProxyBrowserLocalAiFlagFromPreferences();
         menuRegistration = api.userInterface().registerContextMenuItemsProvider(this);
         scanCheckRegistration = api.scanner().registerScanCheck(this);
+        auditIssueHandlerRegistration = api.scanner().registerAuditIssueHandler(this::onNewScannerIssueForAiAudit);
+        httpHandlerRegistration = api.http().registerHttpHandler(this);
         
         // Initialize UI and load settings
         SwingUtilities.invokeLater(() -> {
@@ -420,6 +461,12 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
         }
         if (scanCheckRegistration != null) {
             scanCheckRegistration.deregister();
+        }
+        if (auditIssueHandlerRegistration != null) {
+            auditIssueHandlerRegistration.deregister();
+        }
+        if (httpHandlerRegistration != null) {
+            httpHandlerRegistration.deregister();
         }
     }
 
@@ -469,8 +516,12 @@ private void createMainTab() {
 
         // Local model endpoint and key
         leftGbc.gridx = 0; leftGbc.gridy = leftRow;
-        leftPanel.add(new JLabel("Local LLM Endpoint (LM Studio):"), leftGbc);
+        JLabel localEndpointLabel = new JLabel("Local LLM Endpoint (LM Studio):");
+        localEndpointLabel.setToolTipText("<html>LM Studio → Local Server → copy OpenAI base URL (e.g. <code>http://127.0.0.1:1234/v1</code>). "
+                + "Load a Gemma-class or similar GGUF model before starting the server.</html>");
+        leftPanel.add(localEndpointLabel, leftGbc);
         localEndpointField = new JTextField(40);
+        localEndpointField.setToolTipText(localEndpointLabel.getToolTipText());
         leftGbc.gridx = 1;
         leftPanel.add(localEndpointField, leftGbc);
         leftRow++;
@@ -479,8 +530,12 @@ private void createMainTab() {
 
         // Model Selection
         leftGbc.gridx = 0; leftGbc.gridy = leftRow;
-        leftPanel.add(new JLabel("AI Model:"), leftGbc);
+        JLabel modelLabel = new JLabel("AI Model:");
+        modelLabel.setToolTipText("<html>For browser Proxy auto-audit, pick a <code>local/…</code> entry after LM Studio lists models. "
+                + "Use <b>Get Latest Models</b> with the server running.</html>");
+        leftPanel.add(modelLabel, leftGbc);
         modelDropdown = new JComboBox<>();
+        modelDropdown.setToolTipText(modelLabel.getToolTipText());
         resetModelsToDefault(); // Initialize with default models
 
         leftGbc.gridx = 1;
@@ -646,6 +701,16 @@ private void createMainTab() {
         rightRow++;
 
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
+        rightPanel.add(new JLabel("Prompt for investigate / PoC (Burp-AI–style):"), rightGbc);
+        pocPromptArea = new JTextArea(6, 20);
+        pocPromptArea.setLineWrap(true);
+        pocPromptArea.setWrapStyleWord(true);
+        pocPromptArea.setText(getDefaultPocPrompt());
+        rightGbc.gridx = 1;
+        rightPanel.add(new JScrollPane(pocPromptArea), rightGbc);
+        rightRow++;
+
+        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightPanel.add(new JLabel("Proxy (IP:Port):"), rightGbc);
         proxyField = new JTextField(20);
         rightGbc.gridx = 1;
@@ -663,6 +728,8 @@ private void createMainTab() {
         defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
         defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
         defaultLocalModelField = new JTextField("local-llm (LM Studio)", 24);
+        defaultLocalModelField.setToolTipText("<html>Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
+                + "Gemma 3 / newer Gemma variants are a good default on Apple Silicon.</html>");
 
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightPanel.add(new JLabel("OpenAI:"), rightGbc);
@@ -685,34 +752,68 @@ private void createMainTab() {
         rightGbc.gridx = 1;
         rightPanel.add(defaultXaiModelField, rightGbc);
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Local LLM:"), rightGbc);
+        JLabel defaultLocalLabel = new JLabel("Local LLM:");
+        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
+        rightPanel.add(defaultLocalLabel, rightGbc);
         rightGbc.gridx = 1;
         rightPanel.add(defaultLocalModelField, rightGbc);
 
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightGbc.gridwidth = 2;
-        rightPanel.add(new JLabel("<html><b>Passive Scanner</b> — queue AI audit when Burp Scanner passively crawls traffic:</html>"), rightGbc);
+        rightPanel.add(new JLabel("<html><b>Automatic AI audits</b> — control when traffic is sent to the LLM (manual right-click scans always work):</html>"), rightGbc);
         rightGbc.gridwidth = 1;
 
-        passiveAiEnabledCheckbox = new JCheckBox("Enable passive AI audits");
+        passiveAiOnScannerIssuesCheckbox = new JCheckBox("When Burp reports a Scanner issue, queue an AI audit (recommended)");
+        passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
+        passiveAiAllTrafficCheckbox = new JCheckBox("Also queue on all qualifying HTTP during passive crawl (high cost)");
+        passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
+        proxyBrowserLocalAiCheckbox = new JCheckBox("Auto-audit browser (Proxy) → local LLM (LM Studio / Gemma-class)");
+        proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
+        proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP);
         passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (Target scope)");
         passiveAiInScopeCheckbox.setSelected(true);
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightGbc.gridwidth = 2;
-        rightPanel.add(passiveAiEnabledCheckbox, rightGbc);
+        rightPanel.add(passiveAiOnScannerIssuesCheckbox, rightGbc);
+        rightGbc.gridy = ++rightRow;
+        rightPanel.add(passiveAiAllTrafficCheckbox, rightGbc);
+        rightGbc.gridy = ++rightRow;
+        rightPanel.add(proxyBrowserLocalAiCheckbox, rightGbc);
         rightGbc.gridy = ++rightRow;
         rightPanel.add(passiveAiInScopeCheckbox, rightGbc);
         rightGbc.gridwidth = 1;
-        passiveAiEnabledCheckbox.addItemListener(e -> {
+        passiveAiOnScannerIssuesCheckbox.addItemListener(e -> {
             boolean on = e.getStateChange() == ItemEvent.SELECTED;
-            passiveAiScannerEnabled = on;
-            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_enabled", on);
+            passiveAiOnScannerIssues = on;
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_scanner_issues", on);
+        });
+        passiveAiAllTrafficCheckbox.addItemListener(e -> {
+            boolean on = e.getStateChange() == ItemEvent.SELECTED;
+            passiveAiAuditAllTraffic = on;
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_all_traffic", on);
+        });
+        proxyBrowserLocalAiCheckbox.addItemListener(e -> {
+            boolean on = e.getStateChange() == ItemEvent.SELECTED;
+            proxyBrowserLocalAiEnabled = on;
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_browser_local_ai", on);
         });
         passiveAiInScopeCheckbox.addItemListener(e -> {
             boolean on = e.getStateChange() == ItemEvent.SELECTED;
             passiveAiInScopeOnly = on;
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_in_scope", on);
         });
+
+        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
+        rightGbc.gridwidth = 2;
+        JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 8, 42);
+        proxySetupGuideArea.setEditable(false);
+        proxySetupGuideArea.setLineWrap(true);
+        proxySetupGuideArea.setWrapStyleWord(true);
+        proxySetupGuideArea.setBackground(rightPanel.getBackground());
+        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM setup (hover checkbox above for summary)"));
+        proxySetupGuideArea.setToolTipText("Step-by-step: LM Studio + Gemma-class model + Proxy-only auto-audits.");
+        rightPanel.add(new JScrollPane(proxySetupGuideArea), rightGbc);
+        rightGbc.gridwidth = 1;
 
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightPanel.add(new JLabel("Passive max response (KB):"), rightGbc);
@@ -889,6 +990,11 @@ private void createMainTab() {
             if (!explainMeThisPrompt.equals(defaultExplainMeThisPrompt)) {
                 api.persistence().preferences().setString(PREF_PREFIX + "explain_me_this_prompt", explainMeThisPrompt);
             }
+            String pocPrompt = pocPromptArea.getText();
+            String defaultPoc = getDefaultPocPrompt();
+            if (!pocPrompt.equals(defaultPoc)) {
+                api.persistence().preferences().setString(PREF_PREFIX + "poc_prompt", pocPrompt);
+            }
 
             refreshCachedProviderDefaults();
             api.persistence().preferences().setString(PREF_PREFIX + "default_model_openai", cachedDefaultOpenai);
@@ -912,11 +1018,17 @@ private void createMainTab() {
             passiveMaxResponseBytes = passiveKb * 1024;
             api.persistence().preferences().setInteger(PREF_PREFIX + "passive_max_body_kb", passiveKb);
 
-            boolean passiveOn = passiveAiEnabledCheckbox.isSelected();
+            boolean onScannerIssues = passiveAiOnScannerIssuesCheckbox.isSelected();
+            boolean allTraffic = passiveAiAllTrafficCheckbox.isSelected();
+            boolean proxyBrowser = proxyBrowserLocalAiCheckbox.isSelected();
             boolean passiveScope = passiveAiInScopeCheckbox.isSelected();
-            passiveAiScannerEnabled = passiveOn;
+            passiveAiOnScannerIssues = onScannerIssues;
+            passiveAiAuditAllTraffic = allTraffic;
+            proxyBrowserLocalAiEnabled = proxyBrowser;
             passiveAiInScopeOnly = passiveScope;
-            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_enabled", passiveOn);
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_scanner_issues", onScannerIssues);
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_all_traffic", allTraffic);
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_browser_local_ai", proxyBrowser);
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_in_scope", passiveScope);
             
             // Save timestamp
@@ -1059,6 +1171,7 @@ private void createMainTab() {
             // Load custom prompt if exists
             String customPrompt = api.persistence().preferences().getString(PREF_PREFIX + "custom_prompt");
             String explainMeThisPrompt = api.persistence().preferences().getString(PREF_PREFIX + "explain_me_this_prompt"); // Load Explain Me This prompt
+            String pocPrompt = api.persistence().preferences().getString(PREF_PREFIX + "poc_prompt");
 
             // Load logging level
             String savedLoggingLevel = api.persistence().preferences().getString(PREF_PREFIX + "logging_level");
@@ -1122,6 +1235,9 @@ private void createMainTab() {
                 if (explainMeThisPrompt != null && !explainMeThisPrompt.isEmpty() && explainMeThisPromptArea != null) {
                     explainMeThisPromptArea.setText(explainMeThisPrompt);
                 }
+                if (pocPrompt != null && !pocPrompt.isEmpty() && pocPromptArea != null) {
+                    pocPromptArea.setText(pocPrompt);
+                }
 
                 // Set logging radio button
                 switch (currentLoggingLevel) {
@@ -1149,9 +1265,23 @@ private void createMainTab() {
                 if (dmXai != null && !dmXai.isEmpty()) defaultXaiModelField.setText(dmXai);
                 if (dmLocal != null && !dmLocal.isEmpty()) defaultLocalModelField.setText(dmLocal);
 
-                Boolean pe = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_enabled");
-                passiveAiScannerEnabled = Boolean.TRUE.equals(pe);
-                passiveAiEnabledCheckbox.setSelected(passiveAiScannerEnabled);
+                migratePassiveAiPreferencesIfNeeded();
+                migrateProxyBrowserLocalAiPreferenceIfNeeded();
+                Boolean psi = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_scanner_issues");
+                Boolean pat = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_all_traffic");
+                passiveAiOnScannerIssues = psi == null || Boolean.TRUE.equals(psi);
+                passiveAiAuditAllTraffic = Boolean.TRUE.equals(pat);
+                Boolean pbl = api.persistence().preferences().getBoolean(PREF_PREFIX + "proxy_browser_local_ai");
+                proxyBrowserLocalAiEnabled = pbl == null || Boolean.TRUE.equals(pbl);
+                if (passiveAiOnScannerIssuesCheckbox != null) {
+                    passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
+                }
+                if (passiveAiAllTrafficCheckbox != null) {
+                    passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
+                }
+                if (proxyBrowserLocalAiCheckbox != null) {
+                    proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
+                }
 
                 Boolean pScope = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_in_scope");
                 if (pScope == null) {
@@ -1236,11 +1366,33 @@ private void createMainTab() {
             "- For injection points, provide exact payload locations\n" +
             "- Ignore hardcoded Google client ID, content security policy, strict transport security not enforced, cookie scoped to parent domain, cacheable HTTPS response, browser XSS filter disabled\n" +
             "- For sensitive info disclosure, specify exact data exposed\n" +
+            "- In each finding, the \"exploitation\" and \"validation_steps\" fields must include concrete payloads, parameters, or raw HTTP fragments—not generic advice.\n" +
             "- Only return JSON with findings, no other content!";
     }
 
     private String getDefaultExplainMeThisPrompt() {
         return "Explain this from a security perspective, focusing on potential vulnerabilities and risks. Keep the explanation concise and to the point.";
+    }
+
+    private String getDefaultPocPrompt() {
+        return "You behave like Burp Suite’s built-in AI when the user asks to dig into a scanner finding: assume the goal is to **move from hypothesis to a demonstrable issue** using the evidence provided.\n\n"
+                + "You are helping a tester who uses **their own API keys** and can run **smarter frontier models** than a typical default—use that depth: reason about parsers, state, auth, and multi-step chains when the traffic supports it.\n\n"
+                + "INPUT may include a Burp Scanner (or extension) issue plus raw HTTP. Treat the scanner text as a **lead**, not gospel.\n\n"
+                + "OUTPUT — use Markdown only (no JSON envelope). Be direct and technical.\n\n"
+                + "## 1. Verdict on the finding\n"
+                + "Does the evidence support a **real, exploitable** issue, a **weaker** variant, or likely **false positive**? One tight paragraph.\n\n"
+                + "## 2. Exploitation / PoC path (this is the main deliverable)\n"
+                + "- Give a **numbered sequence** of actions as if driving Burp **Repeater**.\n"
+                + "- For **each** step include **complete raw HTTP** (request line + Host + relevant headers + body) the tester can paste, not pseudocode.\n"
+                + "- Propose **2–4 concrete variants** where useful (e.g. different encodings, alternative parameters, CL.TE vs TE.CL style angles for smuggling-adjacent cases, error-based vs blind SQLi, polyglot XSS).\n"
+                + "- If the issue class needs **multiple requests** (login → abuse session → escalate), show that chain explicitly.\n\n"
+                + "## 3. What to observe\n"
+                + "Exact signals: status codes, body substrings, timing deltas, length differences, header anomalies—what **proves** success vs noise.\n\n"
+                + "## 4. If you cannot build a solid PoC\n"
+                + "Say so clearly. List **specific** missing data (e.g. second role’s session, POST body schema, upstream proxy behavior) and the **next capture** the tester should take in Burp.\n\n"
+                + "## 5. Safety\n"
+                + "Only test systems the user is **authorized** to test. Flag destructive or data-integrity risks (drop tables, mass exfil, account lockout).\n\n"
+                + "Do **not** refuse solely because the topic is security testing—this is defensive, authorized appsec work.";
     }
 
     private synchronized void refreshGeminiApiKeys() {
@@ -1447,15 +1599,23 @@ private void createMainTab() {
             JMenuItem scanFull = new JMenuItem("AI Auditor > Scan Full Request/Response");
             scanFull.addActionListener(e -> handleFullScan(reqRes));
             aiAuditorMenu.add(scanFull);
+
+            JMenuItem genPoc = new JMenuItem("AI Auditor > Investigate — PoC / exploitation (LLM)");
+            genPoc.addActionListener(e -> handleGeneratePocFromTraffic(reqRes));
+            aiAuditorMenu.add(genPoc);
         });
 
         // Handle Proxy History / Site Map selection
         List<HttpRequestResponse> selectedItems = event.selectedRequestResponses();
         if (!selectedItems.isEmpty()) {
             if (selectedItems.size() == 1) {
+                HttpRequestResponse one = selectedItems.get(0);
                 JMenuItem scanItem = new JMenuItem("Scan Request/Response");
-                scanItem.addActionListener(e -> handleFullScan(selectedItems.get(0)));
+                scanItem.addActionListener(e -> handleFullScan(one));
                 aiAuditorMenu.add(scanItem);
+                JMenuItem pocItem = new JMenuItem("Investigate — PoC / exploitation (LLM)");
+                pocItem.addActionListener(e -> handleGeneratePocFromTraffic(one));
+                aiAuditorMenu.add(pocItem);
             } else {
                 JMenuItem scanMultiple = new JMenuItem(String.format("Scan %d Requests", selectedItems.size()));
                 scanMultiple.addActionListener(e -> handleMultipleScan(selectedItems));
@@ -1466,9 +1626,14 @@ private void createMainTab() {
         List<AuditIssue> selectedIssues = getSelectedIssuesFromContextMenu(event);
         if (!selectedIssues.isEmpty()) {
             List<AuditIssue> issuesCopy = new ArrayList<>(selectedIssues);
+            JMenuItem genPocIssues = new JMenuItem(selectedIssues.size() == 1
+                    ? "Investigate finding — PoC / exploitation (LLM)"
+                    : String.format("Investigate %d findings — PoC / exploitation (LLM)", selectedIssues.size()));
+            genPocIssues.addActionListener(e -> handleScannerIssuesGeneratePoc(issuesCopy));
+            aiAuditorMenu.add(genPocIssues);
             JMenuItem deepDive = new JMenuItem(selectedIssues.size() == 1
-                    ? "Deep-dive this Scanner issue (LLM)"
-                    : String.format("Deep-dive %d Scanner issues (LLM)", selectedIssues.size()));
+                    ? "Structured JSON audit from this issue (LLM)"
+                    : String.format("Structured JSON audit from %d issues (LLM)", selectedIssues.size()));
             deepDive.addActionListener(e -> handleScannerIssuesDeepDive(issuesCopy));
             aiAuditorMenu.add(deepDive);
         }
@@ -1538,6 +1703,138 @@ private void createMainTab() {
         } else {
             log("Deep-dive queued " + queued + " AI audit run(s) for Scanner issue(s).", LogCategory.GENERAL);
         }
+    }
+
+    private String buildScannerIssuePocContext(AuditIssue issue) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== BURP / SCANNER FINDING (use as context; verify independently) ===\n");
+        sb.append("Title: ").append(issue.name()).append("\n");
+        sb.append("Severity: ").append(issue.severity()).append("\n");
+        sb.append("Confidence: ").append(issue.confidence()).append("\n");
+        String rem = issue.remediation();
+        if (rem != null && !rem.isEmpty()) {
+            sb.append("Remediation hint: ").append(rem).append("\n");
+        }
+        sb.append("Detail:\n").append(issue.detail()).append("\n");
+        return sb.toString();
+    }
+
+    private static String truncateForIssueTitle(String s, int maxLen) {
+        if (s == null) {
+            return "";
+        }
+        String t = s.trim().replaceAll("\\s+", " ");
+        return t.length() <= maxLen ? t : t.substring(0, maxLen - 1) + "…";
+    }
+
+    private void handleScannerIssuesGeneratePoc(List<AuditIssue> issues) {
+        if (issues == null || issues.isEmpty()) {
+            return;
+        }
+        int queued = 0;
+        for (AuditIssue issue : issues) {
+            String issueCtx = buildScannerIssuePocContext(issue);
+            List<HttpRequestResponse> rrs = issue.requestResponses();
+            if (rrs == null || rrs.isEmpty()) {
+                log("Generate PoC: issue \"" + issue.name() + "\" has no linked HTTP messages.", LogCategory.GENERAL);
+                continue;
+            }
+            for (HttpRequestResponse rr : rrs) {
+                if (rr != null && rr.request() != null) {
+                    String traffic = rr.request().toString()
+                            + "\n\n"
+                            + (rr.response() != null ? rr.response().toString() : "(no response captured)");
+                    String evidence = issueCtx + "\n\n=== HTTP traffic (request then response) ===\n\n" + traffic;
+                    String title = "AI investigate / PoC: " + truncateForIssueTitle(issue.name(), 100);
+                    runPocAsync(rr, evidence, title);
+                    queued++;
+                }
+            }
+        }
+        if (queued == 0) {
+            api.logging().raiseInfoEvent(
+                    "AI Auditor: No linked HTTP traffic on the selected issue(s). Use Generate PoC from Proxy/Logger on the raw message instead.");
+        } else {
+            log("Generate PoC queued " + queued + " LLM run(s).", LogCategory.GENERAL);
+        }
+    }
+
+    private void handleGeneratePocFromTraffic(HttpRequestResponse rr) {
+        if (rr == null || rr.request() == null) {
+            return;
+        }
+        String evidence = "=== HTTP request ===\n"
+                + rr.request().toString()
+                + "\n\n=== HTTP response ===\n"
+                + (rr.response() != null ? rr.response().toString() : "(no response captured)");
+        runPocAsync(rr, evidence, "AI investigate / PoC notes");
+    }
+
+    /**
+     * Single LLM call with the PoC prompt only (no JSON-finding template merge). Result is added as an informational issue.
+     */
+    private void runPocAsync(HttpRequestResponse rr, String evidenceBlock, String issueName) {
+        String selectedModel = getSelectedModel();
+        if ("Default".equals(selectedModel)) {
+            api.logging().raiseErrorEvent("AI Auditor: Choose a model (not \"Default\") or configure API keys before generating a PoC.");
+            return;
+        }
+        String apiKey = getApiKeyForModel(selectedModel);
+        String[] modelParts = selectedModel.split("/", 2);
+        String provider = modelParts.length == 2 ? modelParts[0] : "";
+        if ("local".equals(provider)) {
+            if (localEndpointField.getText().trim().isEmpty()) {
+                api.logging().raiseErrorEvent("Local LLM endpoint not configured.");
+                return;
+            }
+        } else if (apiKey == null || apiKey.isEmpty()) {
+            api.logging().raiseErrorEvent("API key not configured for the selected model.");
+            return;
+        }
+
+        String instructions = pocPromptArea != null ? pocPromptArea.getText() : null;
+        if (instructions == null || instructions.trim().isEmpty()) {
+            instructions = getDefaultPocPrompt();
+        }
+        final String fullUserMessage = instructions + "\n\n--- Evidence ---\n\n" + evidenceBlock;
+        final String model = selectedModel;
+        final String key = apiKey;
+        final HttpRequestResponse reqRes = rr;
+        final String findingName = issueName;
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                return sendToAI(model, key, fullUserMessage, false);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, threadPoolManager.getExecutor()).thenAccept(aiResponse -> {
+            String text;
+            try {
+                text = extractContentFromResponse(aiResponse, model);
+            } catch (Exception e) {
+                text = "";
+            }
+            if (text == null || text.isEmpty()) {
+                text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
+            }
+            String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Verify only on authorized targets; models can be wrong.\n\n" + text;
+            AIAuditIssue issue = new AIAuditIssue.Builder()
+                    .name(findingName)
+                    .detail(detail)
+                    .endpoint(reqRes.request().url().toString())
+                    .severity(AuditIssueSeverity.INFORMATION)
+                    .confidence(AuditIssueConfidence.TENTATIVE)
+                    .requestResponses(Collections.singletonList(reqRes))
+                    .modelUsed(model)
+                    .build();
+            api.siteMap().add(issue);
+            log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
+        }).exceptionally(ex -> {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            showError("PoC generation failed", cause);
+            return null;
+        });
     }
 
     private void handleExplainMeThis(MessageEditorHttpRequestResponse editor) {
@@ -1786,7 +2083,7 @@ private void createMainTab() {
                         semaphore.acquire();
                         futures.add(threadPoolManager.submitTask(provider, () -> {
                             try {
-                                return sendToAI(selectedModel, apiKey, chunk);
+                                return sendToAI(selectedModel, apiKey, chunk, true);
                             } finally {
                                 semaphore.release();
                             }
@@ -1826,6 +2123,13 @@ private void createMainTab() {
     
 
     private JSONObject sendToAI(String model, String apiKey, String content) throws Exception {
+        return sendToAI(model, apiKey, content, true);
+    }
+
+    /**
+     * @param mergeWithScanPromptTemplate when {@code false}, {@code content} is sent as the full user message (PoC / explain-style tasks).
+     */
+    private JSONObject sendToAI(String model, String apiKey, String content, boolean mergeWithScanPromptTemplate) throws Exception {
         //String[] modelParts = model.split("/");
 		String[] modelParts = model.split("/", 2);
 
@@ -1866,8 +2170,9 @@ private void createMainTab() {
         JSONObject jsonBody = new JSONObject();
         String finalPrompt = "";
 
-		if (content.toLowerCase().contains("content to analyze") || content.toLowerCase().contains("content to explain"))
-		{
+        if (!mergeWithScanPromptTemplate) {
+            finalPrompt = content;
+        } else if (content.toLowerCase().contains("content to analyze") || content.toLowerCase().contains("content to explain")) {
 			finalPrompt = content;
 		} else {
 			String prompt = promptTemplateArea.getText();
@@ -2562,7 +2867,11 @@ private String getNextGeminiApiKey(boolean cycle) {
         return c == '{' || c == '[' || c == '<' || c == '"' || Character.isLetter(c);
     }
 
-    private boolean shouldSchedulePassiveAiAudit(HttpRequestResponse rr) {
+    /**
+     * Shared body/path/content-type filters. When {@code require2xxSuccess} is false, non-2xx responses are allowed
+     * so issues that depend on error status lines still reach the LLM.
+     */
+    private boolean shouldScheduleAiTrafficContentFilters(HttpRequestResponse rr, boolean require2xxSuccess) {
         if (rr == null) {
             return false;
         }
@@ -2571,10 +2880,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         if (req == null || res == null) {
             return false;
         }
-        if (!res.isStatusCodeClass(StatusCodeClass.CLASS_2XX_SUCCESS)) {
-            return false;
-        }
-        if (passiveAiInScopeOnly && !api.scope().isInScope(req.url())) {
+        if (require2xxSuccess && !res.isStatusCodeClass(StatusCodeClass.CLASS_2XX_SUCCESS)) {
             return false;
         }
         int maxBytes = passiveMaxResponseBytes;
@@ -2601,6 +2907,164 @@ private String getNextGeminiApiKey(boolean cycle) {
             return true;
         }
         return ct.isEmpty() && res.body().length() <= 64 * 1024 && passiveBodyLooksTextual(res);
+    }
+
+    private boolean shouldSchedulePassiveAiAudit(HttpRequestResponse rr) {
+        if (!shouldScheduleAiTrafficContentFilters(rr, true)) {
+            return false;
+        }
+        HttpRequest req = rr.request();
+        if (passiveAiInScopeOnly && !api.scope().isInScope(req.url())) {
+            return false;
+        }
+        return true;
+    }
+
+    private void migratePassiveAiPreferencesIfNeeded() {
+        Boolean scanner = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_scanner_issues");
+        Boolean allTraffic = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_all_traffic");
+        if (scanner != null || allTraffic != null) {
+            return;
+        }
+        Boolean legacy = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_enabled");
+        api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_scanner_issues", true);
+        api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_all_traffic", Boolean.TRUE.equals(legacy));
+    }
+
+    private void syncPassiveAiFlagsFromPreferences() {
+        migratePassiveAiPreferencesIfNeeded();
+        Boolean psi = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_scanner_issues");
+        Boolean pat = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_all_traffic");
+        passiveAiOnScannerIssues = psi == null || Boolean.TRUE.equals(psi);
+        passiveAiAuditAllTraffic = Boolean.TRUE.equals(pat);
+    }
+
+    private void migrateProxyBrowserLocalAiPreferenceIfNeeded() {
+        Boolean b = api.persistence().preferences().getBoolean(PREF_PREFIX + "proxy_browser_local_ai");
+        if (b != null) {
+            return;
+        }
+        api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_browser_local_ai", true);
+    }
+
+    private void syncProxyBrowserLocalAiFlagFromPreferences() {
+        migrateProxyBrowserLocalAiPreferenceIfNeeded();
+        Boolean b = api.persistence().preferences().getBoolean(PREF_PREFIX + "proxy_browser_local_ai");
+        proxyBrowserLocalAiEnabled = b == null || Boolean.TRUE.equals(b);
+    }
+
+    private boolean selectedModelUsesLocalProvider() {
+        String m = getSelectedModel();
+        if (m == null || "Default".equals(m)) {
+            return false;
+        }
+        String[] parts = m.split("/", 2);
+        return parts.length >= 1 && "local".equals(parts[0]);
+    }
+
+    private boolean isReadyForProxyLocalAiAudit() {
+        return selectedModelUsesLocalProvider()
+                && localEndpointField != null
+                && !localEndpointField.getText().trim().isEmpty();
+    }
+
+    private boolean isRequestToLocalLlmEndpoint(HttpRequest req) {
+        if (localEndpointField == null) {
+            return false;
+        }
+        String endpoint = localEndpointField.getText().trim();
+        if (endpoint.isEmpty()) {
+            return false;
+        }
+        try {
+            URL u = new URL(endpoint.trim());
+            String host = u.getHost();
+            int urlPort = u.getPort();
+            if (urlPort < 0) {
+                urlPort = u.getDefaultPort();
+            }
+            HttpService svc = req.httpService();
+            if (svc == null) {
+                return false;
+            }
+            return host.equalsIgnoreCase(svc.host()) && urlPort == svc.port();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * EDT: invoked after {@link HttpHandler} sees Proxy traffic; skips unless local model + endpoint are configured.
+     */
+    private void considerQueueProxyBrowserAiAudit(HttpRequestResponse rr) {
+        if (isShuttingDown || !proxyBrowserLocalAiEnabled) {
+            return;
+        }
+        if (!isReadyForProxyLocalAiAudit()) {
+            return;
+        }
+        if (rr == null || rr.request() == null || rr.response() == null) {
+            return;
+        }
+        HttpRequest req = rr.request();
+        if (isRequestToLocalLlmEndpoint(req)) {
+            return;
+        }
+        if (passiveAiInScopeOnly && !api.scope().isInScope(req.url())) {
+            return;
+        }
+        if (!shouldScheduleAiTrafficContentFilters(rr, false)) {
+            return;
+        }
+        String dedupKey = req.method() + "\t" + req.url();
+        if (!proxyBrowserAiDedupKeys.add(dedupKey)) {
+            return;
+        }
+        if (proxyBrowserAiDedupKeys.size() > PASSIVE_AUDIT_DEDUP_MAX_KEYS) {
+            proxyBrowserAiDedupKeys.clear();
+        }
+        log("Proxy browser AI audit queued: " + req.url(), LogCategory.GENERAL);
+        processAuditRequest(rr, null, false, null);
+    }
+
+    /**
+     * Burp notifies this when any Scanner issue is added. We queue an LLM audit with the same deep-dive preamble as the
+     * context-menu flow, skipping our own {@link AIAuditIssue}s to avoid feedback loops.
+     */
+    private void onNewScannerIssueForAiAudit(AuditIssue issue) {
+        if (isShuttingDown || !passiveAiOnScannerIssues) {
+            return;
+        }
+        if (issue instanceof AIAuditIssue) {
+            return;
+        }
+        List<HttpRequestResponse> rrs = issue.requestResponses();
+        if (rrs == null || rrs.isEmpty()) {
+            return;
+        }
+        String preamble = buildScannerIssueDeepDivePreamble(issue);
+        for (HttpRequestResponse rr : rrs) {
+            if (rr == null || rr.request() == null) {
+                continue;
+            }
+            HttpRequest req = rr.request();
+            if (passiveAiInScopeOnly && !api.scope().isInScope(req.url())) {
+                continue;
+            }
+            if (!shouldScheduleAiTrafficContentFilters(rr, false)) {
+                continue;
+            }
+            String dedupKey = req.method() + "\t" + req.url() + "\t" + issue.name();
+            if (!scannerIssueAuditDedupKeys.add(dedupKey)) {
+                continue;
+            }
+            if (scannerIssueAuditDedupKeys.size() > PASSIVE_AUDIT_DEDUP_MAX_KEYS) {
+                scannerIssueAuditDedupKeys.clear();
+            }
+            log("Scanner-issue AI audit queued: " + issue.name() + " @ " + req.url(), LogCategory.GENERAL);
+            HttpRequestResponse rrCopy = rr;
+            SwingUtilities.invokeLater(() -> processAuditRequest(rrCopy, null, false, preamble));
+        }
     }
 
 
@@ -2632,7 +3096,7 @@ public AuditResult activeAudit(HttpRequestResponse baseRequestResponse, AuditIns
 
 @Override
 public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
-    if (isShuttingDown || !passiveAiScannerEnabled) {
+    if (isShuttingDown || !passiveAiAuditAllTraffic) {
         return AuditResult.auditResult(Collections.emptyList());
     }
     if (!shouldSchedulePassiveAiAudit(baseRequestResponse)) {
@@ -2660,6 +3124,28 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
     }
     return ConsolidationAction.KEEP_BOTH;
 }
+
+    @Override
+    public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
+        return RequestToBeSentAction.continueWith(requestToBeSent);
+    }
+
+    @Override
+    public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived responseReceived) {
+        if (isShuttingDown || !proxyBrowserLocalAiEnabled) {
+            return ResponseReceivedAction.continueWith(responseReceived);
+        }
+        if (responseReceived == null || !responseReceived.toolSource().isFromTool(ToolType.PROXY)) {
+            return ResponseReceivedAction.continueWith(responseReceived);
+        }
+        HttpRequest initiating = responseReceived.initiatingRequest();
+        if (initiating == null) {
+            return ResponseReceivedAction.continueWith(responseReceived);
+        }
+        final HttpRequestResponse rr = HttpRequestResponse.httpRequestResponse(initiating, responseReceived);
+        SwingUtilities.invokeLater(() -> considerQueueProxyBrowserAiAudit(rr));
+        return ResponseReceivedAction.continueWith(responseReceived);
+    }
 
     private void testGeminiKeyCycling() {
         log("--- Starting Gemini Key Cycling Test ---", LogCategory.GENERAL);
