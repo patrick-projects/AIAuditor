@@ -130,10 +130,9 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
 
     private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP = "<html><body style='width:380px'>"
-            + "Queues the same AI audit as manual scan, but only for messages sent through Burp’s <b>Proxy</b> "
-            + "(normal browser pace). Skips Scanner/crawler volume. "
-            + "You must select a <b>local/…</b> model and set <b>Local LLM Endpoint</b> below (LM Studio). "
-            + "On Apple Silicon, <b>Google Gemma 3</b> or newer (incl. Gemma 4 when published) as a GGUF chat model is a strong default."
+            + "Queues the same AI audit as manual scan for Burp’s <b>Proxy</b> (browser pace). Optionally add <b>Repeater</b> via the checkbox below. "
+            + "Skips Scanner/crawler volume. Uses the <b>automatic audits</b> model + <b>Local LLM Endpoint</b> (LM Studio). "
+            + "On Apple Silicon, <b>Gemma 3+</b> GGUF chat models are a strong default."
             + "</body></html>";
 
     private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
@@ -144,7 +143,9 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
             + "3) Paste that URL into \"Local LLM Endpoint\" on the left, set AI Model to local/local-llm or your loaded id, Save.\n"
             + "4) Enable \"Auto-audit browser (Proxy) → local LLM\" below. Browse through Burp; only Proxy traffic is analyzed.\n"
             + "5) Optional: point Burp’s proxy at 127.0.0.1:8080 and this extension at the LM Studio URL — "
-            + "requests to the LM host are skipped to avoid feedback loops.\n";
+            + "requests to the LM host are skipped to avoid feedback loops.\n"
+            + "6) If you set \"Proxy (IP:Port)\" here for cloud APIs, localhost and your LM Studio host still connect directly "
+            + "(Burp’s own upstream proxy setting does not affect that path).\n";
      
      private MontoyaApi api;
      private PersistedObject persistedData;
@@ -163,7 +164,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private AtomicInteger currentGeminiKeyIndex = new AtomicInteger(0);
     private JTextField localEndpointField;
     private JPasswordField localKeyField;
-    private JComboBox<String> modelDropdown;
+    /** Models for automatic paths: Scanner issues, Proxy/Repeater browser capture, passive crawl-all. */
+    private JComboBox<String> automaticAuditModelDropdown;
+    /** Models for manual actions: right-click scan, PoC, Explain, issue deep-dive from context menu. */
+    private JComboBox<String> manualInvestigationModelDropdown;
     private JTextField filterModelsField;
      private JTextArea promptTemplateArea;
      private JTextArea explainMeThisPromptArea; // New field for Explain Me This custom prompt
@@ -204,6 +208,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private JCheckBox passiveAiOnScannerIssuesCheckbox;
     private JCheckBox passiveAiAllTrafficCheckbox;
     private JCheckBox proxyBrowserLocalAiCheckbox;
+    private JCheckBox proxyIncludeRepeaterCheckbox;
     private JCheckBox passiveAiInScopeCheckbox;
     private JTextField passiveMaxBodyKbField;
     /** When true, queue LLM audit only when Burp reports a Scanner issue (not from this extension). */
@@ -212,11 +217,25 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private volatile boolean passiveAiAuditAllTraffic = false;
     /** Proxy-originated browser traffic → LLM when local model is configured. */
     private volatile boolean proxyBrowserLocalAiEnabled = true;
+    /** When true, also treat Repeater responses like Proxy for auto-audit (same local-model rules). */
+    private volatile boolean proxyIncludeRepeater = false;
     private volatile boolean passiveAiInScopeOnly = true;
     private volatile int passiveMaxResponseBytes = DEFAULT_PASSIVE_MAX_BODY_KB * 1024;
     private final Set<String> passiveAuditDedupKeys = ConcurrentHashMap.newKeySet();
-    private final Set<String> scannerIssueAuditDedupKeys = ConcurrentHashMap.newKeySet();
     private final Set<String> proxyBrowserAiDedupKeys = ConcurrentHashMap.newKeySet();
+
+    private static final class PendingScannerIssueBatch {
+        final List<AuditIssue> issues = new ArrayList<>();
+        volatile HttpRequestResponse representativeRr;
+        volatile ScheduledFuture<?> scheduledFlush;
+    }
+
+    private final ConcurrentHashMap<String, PendingScannerIssueBatch> pendingScannerIssueBatches = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scannerIssueDebounceScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ai-auditor-scanner-issue-debounce");
+        t.setDaemon(true);
+        return t;
+    });
 
 	private JRadioButton detailedLoggingRadio;
 	private JRadioButton detailedOnelinerLoggingRadio;
@@ -423,6 +442,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
         // Register extension capabilities
         api.extension().setName(EXTENSION_NAME);
         migratePassiveAiPreferencesIfNeeded();
+        migrateDualModelPreferencesIfNeeded();
         syncPassiveAiFlagsFromPreferences();
         migrateProxyBrowserLocalAiPreferenceIfNeeded();
         syncProxyBrowserLocalAiFlagFromPreferences();
@@ -467,6 +487,15 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
         }
         if (httpHandlerRegistration != null) {
             httpHandlerRegistration.deregister();
+        }
+        scannerIssueDebounceScheduler.shutdown();
+        try {
+            if (!scannerIssueDebounceScheduler.awaitTermination(2, TimeUnit.SECONDS)) {
+                scannerIssueDebounceScheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scannerIssueDebounceScheduler.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -528,18 +557,32 @@ private void createMainTab() {
 
         addApiKeyField(leftPanel, leftGbc, leftRow++, "Local LLM API Key:", localKeyField = new JPasswordField(40), "local");
 
-        // Model Selection
+        // Model selection (automatic vs manual investigation)
         leftGbc.gridx = 0; leftGbc.gridy = leftRow;
-        JLabel modelLabel = new JLabel("AI Model:");
-        modelLabel.setToolTipText("<html>For browser Proxy auto-audit, pick a <code>local/…</code> entry after LM Studio lists models. "
-                + "Use <b>Get Latest Models</b> with the server running.</html>");
-        leftPanel.add(modelLabel, leftGbc);
-        modelDropdown = new JComboBox<>();
-        modelDropdown.setToolTipText(modelLabel.getToolTipText());
-        resetModelsToDefault(); // Initialize with default models
+        JLabel autoModelLabel = new JLabel("AI Model (automatic audits):");
+        autoModelLabel.setToolTipText("<html>Used for Scanner-issue auto-audits, Proxy/Repeater browser capture, and passive “all traffic”. "
+                + "Typical choice: <code>local/…</code> (LM Studio) or a small cloud model.</html>");
+        leftPanel.add(autoModelLabel, leftGbc);
+        automaticAuditModelDropdown = new JComboBox<>();
+        automaticAuditModelDropdown.setToolTipText(autoModelLabel.getToolTipText());
 
         leftGbc.gridx = 1;
-        leftPanel.add(modelDropdown, leftGbc);
+        leftPanel.add(automaticAuditModelDropdown, leftGbc);
+        leftRow++;
+
+        leftGbc.gridx = 0; leftGbc.gridy = leftRow;
+        JLabel manualModelLabel = new JLabel("AI Model (manual / PoC / Explain):");
+        manualModelLabel.setToolTipText("<html>Used for right-click scans, Explain me this, PoC generation, and context-menu issue deep-dive. "
+                + "Use a stronger model here if automatic audits use a small local model.</html>");
+        leftPanel.add(manualModelLabel, leftGbc);
+        manualInvestigationModelDropdown = new JComboBox<>();
+        manualInvestigationModelDropdown.setToolTipText(manualModelLabel.getToolTipText());
+
+        leftGbc.gridx = 1;
+        leftPanel.add(manualInvestigationModelDropdown, leftGbc);
+        leftRow++;
+
+        resetModelsToDefault(); // Initialize both dropdowns with default models
 
         // Buttons for model management
         JPanel modelButtonsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
@@ -713,6 +756,9 @@ private void createMainTab() {
         rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
         rightPanel.add(new JLabel("Proxy (IP:Port):"), rightGbc);
         proxyField = new JTextField(20);
+        proxyField.setToolTipText("<html>Optional HTTP proxy for <b>this extension’s</b> outbound API calls (OpenAI, Gemini, etc.). "
+                + "Traffic to <b>localhost</b>, <b>127.0.0.1</b>, and your <b>Local LLM Endpoint</b> host is sent <b>direct</b> "
+                + "so LM Studio still works when Burp uses a separate upstream proxy for browsing.</html>");
         rightGbc.gridx = 1;
         rightPanel.add(proxyField, rightGbc);
         rightRow++;
@@ -779,6 +825,11 @@ private void createMainTab() {
         rightPanel.add(passiveAiAllTrafficCheckbox, rightGbc);
         rightGbc.gridy = ++rightRow;
         rightPanel.add(proxyBrowserLocalAiCheckbox, rightGbc);
+        proxyIncludeRepeaterCheckbox = new JCheckBox("Also auto-audit Repeater responses (same rules as Proxy)");
+        proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
+        proxyIncludeRepeaterCheckbox.setToolTipText("Queues LLM audits for HTTP responses sent from Repeater, not only the browser Proxy.");
+        rightGbc.gridy = ++rightRow;
+        rightPanel.add(proxyIncludeRepeaterCheckbox, rightGbc);
         rightGbc.gridy = ++rightRow;
         rightPanel.add(passiveAiInScopeCheckbox, rightGbc);
         rightGbc.gridwidth = 1;
@@ -796,6 +847,11 @@ private void createMainTab() {
             boolean on = e.getStateChange() == ItemEvent.SELECTED;
             proxyBrowserLocalAiEnabled = on;
             api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_browser_local_ai", on);
+        });
+        proxyIncludeRepeaterCheckbox.addItemListener(e -> {
+            boolean on = e.getStateChange() == ItemEvent.SELECTED;
+            proxyIncludeRepeater = on;
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_include_repeater", on);
         });
         passiveAiInScopeCheckbox.addItemListener(e -> {
             boolean on = e.getStateChange() == ItemEvent.SELECTED;
@@ -974,9 +1030,12 @@ private void createMainTab() {
 			threadPoolManager.updateRateLimiters(this.rateLimitCount, this.rateLimitWindow);
             
 			
-            // Save selected model
-            String selectedModel = (String) modelDropdown.getSelectedItem();
-            api.persistence().preferences().setString(PREF_PREFIX + "selected_model", selectedModel);
+            // Save selected models (dual) + legacy single key for older builds
+            String autoModel = (String) automaticAuditModelDropdown.getSelectedItem();
+            String manualModel = (String) manualInvestigationModelDropdown.getSelectedItem();
+            api.persistence().preferences().setString(PREF_PREFIX + "selected_model_automatic", autoModel);
+            api.persistence().preferences().setString(PREF_PREFIX + "selected_model_manual", manualModel);
+            api.persistence().preferences().setString(PREF_PREFIX + "selected_model", manualModel);
             
             // Save custom prompt if modified from default
             String customPrompt = promptTemplateArea.getText();
@@ -1021,14 +1080,17 @@ private void createMainTab() {
             boolean onScannerIssues = passiveAiOnScannerIssuesCheckbox.isSelected();
             boolean allTraffic = passiveAiAllTrafficCheckbox.isSelected();
             boolean proxyBrowser = proxyBrowserLocalAiCheckbox.isSelected();
+            boolean includeRepeater = proxyIncludeRepeaterCheckbox.isSelected();
             boolean passiveScope = passiveAiInScopeCheckbox.isSelected();
             passiveAiOnScannerIssues = onScannerIssues;
             passiveAiAuditAllTraffic = allTraffic;
             proxyBrowserLocalAiEnabled = proxyBrowser;
+            proxyIncludeRepeater = includeRepeater;
             passiveAiInScopeOnly = passiveScope;
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_scanner_issues", onScannerIssues);
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_all_traffic", allTraffic);
             api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_browser_local_ai", proxyBrowser);
+            api.persistence().preferences().setBoolean(PREF_PREFIX + "proxy_include_repeater", includeRepeater);
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_in_scope", passiveScope);
             
             // Save timestamp
@@ -1165,8 +1227,9 @@ private void createMainTab() {
 
 
             
-            // Load selected model
-            String selectedModel = api.persistence().preferences().getString(PREF_PREFIX + "selected_model");
+            migrateDualModelPreferencesIfNeeded();
+            String selectedModelAutomatic = api.persistence().preferences().getString(PREF_PREFIX + "selected_model_automatic");
+            String selectedModelManual = api.persistence().preferences().getString(PREF_PREFIX + "selected_model_manual");
             
             // Load custom prompt if exists
             String customPrompt = api.persistence().preferences().getString(PREF_PREFIX + "custom_prompt");
@@ -1192,7 +1255,7 @@ private void createMainTab() {
             log("- OpenRouter key: " + (openrouterKey != null && !openrouterKey.trim().isEmpty() ? "exists" : "null or empty"), LogCategory.GENERAL);
             log("- xAI key: " + (xaiKey != null && !xaiKey.trim().isEmpty() ? "exists" : "null or empty"), LogCategory.GENERAL);
             log("- Local endpoint: " + (localEndpoint != null && !localEndpoint.trim().isEmpty() ? localEndpoint : "null or empty"), LogCategory.GENERAL);
-            log("- Selected model: " + selectedModel, LogCategory.GENERAL);
+            log("- Automatic model: " + selectedModelAutomatic + ", Manual model: " + selectedModelManual, LogCategory.GENERAL);
             log("- Logging Level: " + currentLoggingLevel.name(), LogCategory.GENERAL);
 
 			log(String.format(
@@ -1221,9 +1284,11 @@ private void createMainTab() {
 
                 applyModelFilter();
                 
-                // Set selected model
-                if (selectedModel != null && modelDropdown != null) {
-                    modelDropdown.setSelectedItem(selectedModel);
+                if (selectedModelAutomatic != null && automaticAuditModelDropdown != null) {
+                    automaticAuditModelDropdown.setSelectedItem(selectedModelAutomatic);
+                }
+                if (selectedModelManual != null && manualInvestigationModelDropdown != null) {
+                    manualInvestigationModelDropdown.setSelectedItem(selectedModelManual);
                 }
                 
                 // Set custom prompt if exists
@@ -1281,6 +1346,11 @@ private void createMainTab() {
                 }
                 if (proxyBrowserLocalAiCheckbox != null) {
                     proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
+                }
+                Boolean pir = api.persistence().preferences().getBoolean(PREF_PREFIX + "proxy_include_repeater");
+                proxyIncludeRepeater = Boolean.TRUE.equals(pir);
+                if (proxyIncludeRepeaterCheckbox != null) {
+                    proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
                 }
 
                 Boolean pScope = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_in_scope");
@@ -1692,7 +1762,7 @@ private void createMainTab() {
             }
             for (HttpRequestResponse rr : rrs) {
                 if (rr != null && rr.request() != null) {
-                    processAuditRequest(rr, null, false, preamble);
+                    processAuditRequest(rr, null, false, preamble, false);
                     queued++;
                 }
             }
@@ -1774,7 +1844,7 @@ private void createMainTab() {
      * Single LLM call with the PoC prompt only (no JSON-finding template merge). Result is added as an informational issue.
      */
     private void runPocAsync(HttpRequestResponse rr, String evidenceBlock, String issueName) {
-        String selectedModel = getSelectedModel();
+        String selectedModel = getManualInvestigationModel();
         if ("Default".equals(selectedModel)) {
             api.logging().raiseErrorEvent("AI Auditor: Choose a model (not \"Default\") or configure API keys before generating a PoC.");
             return;
@@ -1875,12 +1945,12 @@ private void createMainTab() {
                 String finalSelectedText = selectedText;
                 String finalInputForAI = inputForAI; // Capture for use in lambda
                 HttpRequestResponse finalReqRes = editor.requestResponse(); // Capture for use in lambda
+                final String investigationModel = getManualInvestigationModel();
 
                 CompletableFuture.supplyAsync(() -> {
                     try {
-                        String selectedModel = getSelectedModel();
-                        JSONObject aiResponse = sendToAI(selectedModel, getApiKeyForModel(selectedModel), finalPrompt + "\n\nContent to explain:\n" + finalSelectedText);
-                        return extractContentFromResponse(aiResponse, selectedModel);
+                        JSONObject aiResponse = sendToAI(investigationModel, getApiKeyForModel(investigationModel), finalPrompt + "\n\nContent to explain:\n" + finalSelectedText);
+                        return extractContentFromResponse(aiResponse, investigationModel);
                     } catch (Exception e) {
                         api.logging().logToError("Error explaining content: " + e.getMessage());
                         return "Error: " + e.getMessage();
@@ -1899,7 +1969,7 @@ private void createMainTab() {
                             .severity(AuditIssueSeverity.INFORMATION)
                             .confidence(AuditIssueConfidence.CERTAIN)
                             .requestResponses(Collections.singletonList(finalReqRes))
-                            .modelUsed(getSelectedModel())
+                            .modelUsed(investigationModel)
                             .build();							
                     api.siteMap().add(issue);
                     log("'Explain me this' result added to Site Map as an informational finding.", LogCategory.GENERAL);
@@ -1964,7 +2034,7 @@ private void createMainTab() {
         for (HttpRequestResponse reqRes : requests) {
             if (reqRes != null && reqRes.request() != null) {
                 futures.add(CompletableFuture.runAsync(() -> {
-                    processAuditRequest(reqRes, null, false, null);
+                    processAuditRequest(reqRes, null, false, null, false);
                 }, batchExecutor));
             }
         }
@@ -1975,17 +2045,14 @@ private void createMainTab() {
     }
 
     private void processAuditRequest(HttpRequestResponse reqRes, String selectedContent, boolean isSelectedPortion) {
-        processAuditRequest(reqRes, selectedContent, isSelectedPortion, null);
+        processAuditRequest(reqRes, selectedContent, isSelectedPortion, null, false);
     }
 
     private void processAuditRequest(HttpRequestResponse reqRes, String selectedContent, boolean isSelectedPortion,
-            String trafficContextPreamble) {
-		// TEMP: prints full stack trace to Extender > Errors
-        // Thread.dumpStack();   
-
+            String trafficContextPreamble, boolean useAutomaticAuditModel) {
         final String preamble = trafficContextPreamble;
 
-		String selectedModel = getSelectedModel();
+        String selectedModel = useAutomaticAuditModel ? getAutomaticAuditModel() : getManualInvestigationModel();
         String[] modelParts = selectedModel.split("/",2);
         String provider;
         String modelNameForApi;
@@ -2311,6 +2378,37 @@ private void createMainTab() {
     
     
 
+    /**
+     * Extension outbound proxy (AI Auditor settings) should not swallow localhost / LM Studio — those stay direct even
+     * when Burp’s own upstream proxy is configured separately.
+     */
+    private boolean shouldBypassExtensionProxyForUrl(URL url) {
+        if (url == null) {
+            return true;
+        }
+        String host = url.getHost();
+        if (host == null || host.isEmpty()) {
+            return true;
+        }
+        String h = host.toLowerCase(Locale.ROOT);
+        if ("localhost".equals(h) || "127.0.0.1".equals(h) || "::1".equals(h) || "0:0:0:0:0:0:0:1".equals(h)) {
+            return true;
+        }
+        if (localEndpointField != null) {
+            try {
+                String ep = localEndpointField.getText().trim();
+                if (!ep.isEmpty()) {
+                    URL lu = new URL(ep);
+                    if (h.equalsIgnoreCase(lu.getHost())) {
+                        return true;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
     private JSONObject sendRequest(URL url, JSONObject jsonBody, String apiKey, String model) throws Exception {
     HttpURLConnection conn = null;
     BufferedReader reader = null;
@@ -2325,7 +2423,7 @@ private void createMainTab() {
             provider = MODEL_MAPPING.get(model);
         }
 
-        if (!proxyString.isEmpty()) {
+        if (!proxyString.isEmpty() && !shouldBypassExtensionProxyForUrl(url)) {
             try {
                 String[] proxyParts = proxyString.split(":");
                 if (proxyParts.length != 2) {
@@ -2343,7 +2441,6 @@ private void createMainTab() {
         } else {
             conn = (HttpURLConnection) url.openConnection();
         }
-		Thread.dumpStack();
         log("Final URL for connection: " + url.toString(), LogCategory.GENERAL);
 
         conn.setRequestMethod("POST");
@@ -2731,21 +2828,42 @@ private AuditIssueConfidence parseConfidence(String confidence) {
     }
 }
 
-private String getSelectedModel() {
-    String model = (String) modelDropdown.getSelectedItem();
-    if ("Default".equals(model)) {
-        if (!new String(openaiKeyField.getPassword()).isEmpty()) return cachedDefaultOpenai;
-        if (!geminiApiKeys.isEmpty()) return cachedDefaultGemini;
-        if (!new String(claudeKeyField.getPassword()).isEmpty()) return cachedDefaultClaude;
-        if (!new String(openrouterKeyField.getPassword()).isEmpty()) return cachedDefaultOpenrouter;
-        if (!new String(xaiKeyField.getPassword()).isEmpty()) return cachedDefaultXai;
-        if (!localEndpointField.getText().trim().isEmpty()) return cachedDefaultLocal;
+private String resolveModelFromDropdown(JComboBox<String> dropdown) {
+    if (dropdown == null) {
         return "Default";
     }
-    return model;
+    String model = (String) dropdown.getSelectedItem();
+    if (!"Default".equals(model)) {
+        return model;
+    }
+    if (!new String(openaiKeyField.getPassword()).isEmpty()) {
+        return cachedDefaultOpenai;
+    }
+    if (!geminiApiKeys.isEmpty()) {
+        return cachedDefaultGemini;
+    }
+    if (!new String(claudeKeyField.getPassword()).isEmpty()) {
+        return cachedDefaultClaude;
+    }
+    if (!new String(openrouterKeyField.getPassword()).isEmpty()) {
+        return cachedDefaultOpenrouter;
+    }
+    if (!new String(xaiKeyField.getPassword()).isEmpty()) {
+        return cachedDefaultXai;
+    }
+    if (!localEndpointField.getText().trim().isEmpty()) {
+        return cachedDefaultLocal;
+    }
+    return "Default";
 }
 
+private String getAutomaticAuditModel() {
+    return resolveModelFromDropdown(automaticAuditModelDropdown);
+}
 
+private String getManualInvestigationModel() {
+    return resolveModelFromDropdown(manualInvestigationModelDropdown);
+}
 
 private String getApiKeyForModel(String model) {
     String[] modelParts = model.split("/",2);
@@ -2920,6 +3038,22 @@ private String getNextGeminiApiKey(boolean cycle) {
         return true;
     }
 
+    private void migrateDualModelPreferencesIfNeeded() {
+        String auto = api.persistence().preferences().getString(PREF_PREFIX + "selected_model_automatic");
+        String manual = api.persistence().preferences().getString(PREF_PREFIX + "selected_model_manual");
+        if (auto != null && manual != null) {
+            return;
+        }
+        String legacy = api.persistence().preferences().getString(PREF_PREFIX + "selected_model");
+        String fallback = legacy != null ? legacy : "Default";
+        if (auto == null) {
+            api.persistence().preferences().setString(PREF_PREFIX + "selected_model_automatic", fallback);
+        }
+        if (manual == null) {
+            api.persistence().preferences().setString(PREF_PREFIX + "selected_model_manual", fallback);
+        }
+    }
+
     private void migratePassiveAiPreferencesIfNeeded() {
         Boolean scanner = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_scanner_issues");
         Boolean allTraffic = api.persistence().preferences().getBoolean(PREF_PREFIX + "passive_ai_all_traffic");
@@ -2954,7 +3088,7 @@ private String getNextGeminiApiKey(boolean cycle) {
     }
 
     private boolean selectedModelUsesLocalProvider() {
-        String m = getSelectedModel();
+        String m = getAutomaticAuditModel();
         if (m == null || "Default".equals(m)) {
             return false;
         }
@@ -2993,6 +3127,83 @@ private String getNextGeminiApiKey(boolean cycle) {
         }
     }
 
+    private String auditDedupKeyHostPath(HttpRequest req) {
+        if (req == null) {
+            return "";
+        }
+        String path = req.path();
+        if (path == null || path.isEmpty()) {
+            path = "/";
+        }
+        HttpService svc = req.httpService();
+        String host = svc != null ? svc.host().toLowerCase(Locale.ROOT) : "";
+        return req.method() + "\t" + host + "\t" + path;
+    }
+
+    private String buildCombinedScannerIssuesPreamble(List<AuditIssue> issues) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CONTEXT: Burp reported ").append(issues.size())
+                .append(" scanner issue(s) for this HTTP exchange. Analyze holistically; weigh interactions between findings.\n\n");
+        for (int i = 0; i < issues.size(); i++) {
+            sb.append("--- Scanner issue ").append(i + 1).append(" ---\n");
+            sb.append(buildScannerIssueDeepDivePreamble(issues.get(i)));
+            sb.append("\n\n");
+        }
+        return sb.toString();
+    }
+
+    private static boolean sameScannerIssue(AuditIssue a, AuditIssue b) {
+        if (a == b) {
+            return true;
+        }
+        return Objects.equals(a.name(), b.name())
+                && Objects.equals(a.detail(), b.detail())
+                && Objects.equals(a.severity(), b.severity());
+    }
+
+    private void scheduleScannerIssueBatchFlush(String key, AuditIssue issue, HttpRequestResponse rr) {
+        PendingScannerIssueBatch batch = pendingScannerIssueBatches.computeIfAbsent(key, k -> new PendingScannerIssueBatch());
+        synchronized (batch) {
+            boolean seen = false;
+            for (AuditIssue ex : batch.issues) {
+                if (sameScannerIssue(ex, issue)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                batch.issues.add(issue);
+            }
+            batch.representativeRr = rr;
+            if (batch.scheduledFlush != null) {
+                batch.scheduledFlush.cancel(false);
+            }
+            batch.scheduledFlush = scannerIssueDebounceScheduler.schedule(() -> flushScannerIssueBatch(key), 750, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void flushScannerIssueBatch(String key) {
+        PendingScannerIssueBatch batch = pendingScannerIssueBatches.remove(key);
+        if (batch == null) {
+            return;
+        }
+        final List<AuditIssue> issuesCopy;
+        final HttpRequestResponse rr;
+        synchronized (batch) {
+            if (batch.issues.isEmpty()) {
+                return;
+            }
+            issuesCopy = new ArrayList<>(batch.issues);
+            rr = batch.representativeRr;
+        }
+        if (rr == null || rr.request() == null) {
+            return;
+        }
+        final String preamble = buildCombinedScannerIssuesPreamble(issuesCopy);
+        log("Scanner-issue AI audit queued (batched " + issuesCopy.size() + "): " + key, LogCategory.GENERAL);
+        SwingUtilities.invokeLater(() -> processAuditRequest(rr, null, false, preamble, true));
+    }
+
     /**
      * EDT: invoked after {@link HttpHandler} sees Proxy traffic; skips unless local model + endpoint are configured.
      */
@@ -3016,7 +3227,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         if (!shouldScheduleAiTrafficContentFilters(rr, false)) {
             return;
         }
-        String dedupKey = req.method() + "\t" + req.url();
+        String dedupKey = auditDedupKeyHostPath(req);
         if (!proxyBrowserAiDedupKeys.add(dedupKey)) {
             return;
         }
@@ -3024,7 +3235,7 @@ private String getNextGeminiApiKey(boolean cycle) {
             proxyBrowserAiDedupKeys.clear();
         }
         log("Proxy browser AI audit queued: " + req.url(), LogCategory.GENERAL);
-        processAuditRequest(rr, null, false, null);
+        processAuditRequest(rr, null, false, null, true);
     }
 
     /**
@@ -3042,7 +3253,6 @@ private String getNextGeminiApiKey(boolean cycle) {
         if (rrs == null || rrs.isEmpty()) {
             return;
         }
-        String preamble = buildScannerIssueDeepDivePreamble(issue);
         for (HttpRequestResponse rr : rrs) {
             if (rr == null || rr.request() == null) {
                 continue;
@@ -3054,16 +3264,8 @@ private String getNextGeminiApiKey(boolean cycle) {
             if (!shouldScheduleAiTrafficContentFilters(rr, false)) {
                 continue;
             }
-            String dedupKey = req.method() + "\t" + req.url() + "\t" + issue.name();
-            if (!scannerIssueAuditDedupKeys.add(dedupKey)) {
-                continue;
-            }
-            if (scannerIssueAuditDedupKeys.size() > PASSIVE_AUDIT_DEDUP_MAX_KEYS) {
-                scannerIssueAuditDedupKeys.clear();
-            }
-            log("Scanner-issue AI audit queued: " + issue.name() + " @ " + req.url(), LogCategory.GENERAL);
-            HttpRequestResponse rrCopy = rr;
-            SwingUtilities.invokeLater(() -> processAuditRequest(rrCopy, null, false, preamble));
+            String key = auditDedupKeyHostPath(req);
+            scheduleScannerIssueBatchFlush(key, issue, rr);
         }
     }
 
@@ -3103,7 +3305,7 @@ public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
         return AuditResult.auditResult(Collections.emptyList());
     }
     HttpRequest req = baseRequestResponse.request();
-    String dedupKey = req.method() + "\t" + req.url();
+    String dedupKey = auditDedupKeyHostPath(req);
     if (!passiveAuditDedupKeys.add(dedupKey)) {
         return AuditResult.auditResult(Collections.emptyList());
     }
@@ -3111,7 +3313,7 @@ public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
         passiveAuditDedupKeys.clear();
     }
     log("Passive AI audit queued: " + req.url(), LogCategory.GENERAL);
-    SwingUtilities.invokeLater(() -> processAuditRequest(baseRequestResponse, null, false));
+    SwingUtilities.invokeLater(() -> processAuditRequest(baseRequestResponse, null, false, null, true));
     return AuditResult.auditResult(Collections.emptyList());
 }
 
@@ -3135,7 +3337,12 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
         if (isShuttingDown || !proxyBrowserLocalAiEnabled) {
             return ResponseReceivedAction.continueWith(responseReceived);
         }
-        if (responseReceived == null || !responseReceived.toolSource().isFromTool(ToolType.PROXY)) {
+        if (responseReceived == null) {
+            return ResponseReceivedAction.continueWith(responseReceived);
+        }
+        boolean fromProxy = responseReceived.toolSource().isFromTool(ToolType.PROXY);
+        boolean fromRepeater = proxyIncludeRepeater && responseReceived.toolSource().isFromTool(ToolType.REPEATER);
+        if (!fromProxy && !fromRepeater) {
             return ResponseReceivedAction.continueWith(responseReceived);
         }
         HttpRequest initiating = responseReceived.initiatingRequest();
@@ -3252,18 +3459,30 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
         });
     }
 
-    private void applyModelFilter() {
+    private void restoreDropdownSelection(JComboBox<String> box, String previous) {
+        if (previous == null || box == null) {
+            return;
+        }
+        for (int i = 0; i < box.getItemCount(); i++) {
+            if (previous.equals(box.getItemAt(i))) {
+                box.setSelectedIndex(i);
+                return;
+            }
+        }
+    }
+
+    private void repopulateFilteredModelDropdown(JComboBox<String> modelDropdown) {
         String filterText = filterModelsField.getText().toLowerCase();
         String[] keywords = filterText.split(",");
 
         modelDropdown.removeAllItems();
-        modelDropdown.addItem("Default"); // Always add Default first
-        modelDropdown.addItem("local/local-llm (LM Studio)"); // Always add local-llm last
+        modelDropdown.addItem("Default");
+        modelDropdown.addItem("local/local-llm (LM Studio)");
 
         List<String> filteredModels = new ArrayList<>();
         for (String model : availableModels) {
             if ("Default".equals(model) || "local/local-llm (LM Studio)".equals(model)) {
-                continue; // Skip these for filtering, they are added explicitly
+                continue;
             }
 
             boolean matchesFilter = true;
@@ -3280,12 +3499,22 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
             }
         }
 
-        // Sort filtered models alphabetically
         Collections.sort(filteredModels);
-
         for (String model : filteredModels) {
             modelDropdown.addItem(model);
         }
+    }
+
+    private void applyModelFilter() {
+        if (automaticAuditModelDropdown == null || manualInvestigationModelDropdown == null) {
+            return;
+        }
+        String prevAuto = (String) automaticAuditModelDropdown.getSelectedItem();
+        String prevManual = (String) manualInvestigationModelDropdown.getSelectedItem();
+        repopulateFilteredModelDropdown(automaticAuditModelDropdown);
+        repopulateFilteredModelDropdown(manualInvestigationModelDropdown);
+        restoreDropdownSelection(automaticAuditModelDropdown, prevAuto);
+        restoreDropdownSelection(manualInvestigationModelDropdown, prevManual);
     }
 			
 			

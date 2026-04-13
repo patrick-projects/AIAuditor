@@ -177,6 +177,15 @@ Separate text boxes fir differnt prompts are are available for scanning and for 
 * **Apache Maven**
 
 ## Installation
+
+### Pre-built JAR (easiest)
+
+1. Open **[Releases](https://github.com/patrick-projects/AIAuditor/releases/latest)** for this repository.
+2. Download **`ai-auditor-1.2.0-jar-with-dependencies.jar`** (or the `*-jar-with-dependencies.jar` attached to the latest release).
+3. In Burp: **Extensions** → **Add** → **Java** → select that JAR → **Next**.
+
+Maintainers: publishing a release is done by pushing a version tag after `main` builds clean, for example `git tag v1.2.0 && git push origin v1.2.0`. GitHub Actions attaches the fat JAR to the new release automatically.
+
 ### Building from Source
 #### Windows
 1. Install JDK 17:
@@ -189,8 +198,8 @@ winget install Apache.Maven
 ```
 3. Clone and Build:
 ```
-git clone https://github.com/V9Y1nf0S3C/aiauditor.git
-cd aiauditor
+git clone https://github.com/patrick-projects/AIAuditor.git
+cd AIAuditor
 mvn clean package
 ```
 #### macOS
@@ -204,8 +213,8 @@ brew install openjdk@17 maven
 ```
 3. Clone and Build:
 ```
-git clone https://github.com/V9Y1nf0S3C/aiauditor.git
-cd aiauditor
+git clone https://github.com/patrick-projects/AIAuditor.git
+cd AIAuditor
 mvn clean package
 ```
 #### Linux (Ubuntu/Debian)
@@ -216,15 +225,15 @@ sudo apt install openjdk-17-jdk maven
 ```
 2. Clone and Build:
 ```
-git clone https://github.com/V9Y1nf0S3C/aiauditor.git
-cd aiauditor
+git clone https://github.com/patrick-projects/AIAuditor.git
+cd AIAuditor
 mvn clean package
 ```
 
-The compiled JAR will be available at `target/ai-auditor-1.1-SNAPSHOT-jar-with-dependencies.jar`.
+The compiled JAR will be available at `target/ai-auditor-1.2.0-jar-with-dependencies.jar`.
 
 ## Installation: Loading JAR in Burp Suite (Recommended)
-1. [Download](https://github.com/V9Y1nf0S3C/AIAuditor/releases/tag/v1.1) the latest version in **[Releases](https://github.com/V9Y1nf0S3C/AIAuditor/releases/tag/v1.1)**.
+1. Use a JAR from **[Releases](https://github.com/patrick-projects/AIAuditor/releases/latest)** (see **Pre-built JAR** above), or build from source and use the file under `target/`.
 2. Open **Burp Suite Professional Edition** or **Burp Suite Enterprise Edition**.
 3. Navigate to the **Extensions** tab.
 4. Click **Add**, select **Java** as the extension type, and upload the `JAR` file.
