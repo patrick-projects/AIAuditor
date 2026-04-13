@@ -253,12 +253,11 @@ The compiled JAR will be available at `target/ai-auditor-1.2.0-jar-with-dependen
 
 ## Usage
 ### Initial Setup
-1. Go to the AI Auditor tab in Burp Suite.
-2. Enter your API key(s) for OpenAI, Gemini, Claude, and/or OpenRouter.
-3. To use a local LLM, enter your LM Studio endpoint (e.g., `http://localhost:1234/v1`).
-4. Click **Validate** to confirm each key/endpoint is working.
-5. *Optional*: Add **Custom Instructions** to refine the analysis.
-6. Save your settings.
+1. Open the **AI Auditor** suite tab. The UI is split into sub-tabs: **Setup & providers** (keys and models), **Automation & defaults** (when background LLM runs), **Prompts**, and **Advanced & status** (retries, logging, task queue).
+2. On **Setup & providers**, enter API key(s) for the providers you use (OpenAI, Gemini, Claude, OpenRouter, xAI) and/or your **Local LLM** endpoint.
+3. Click **Validate** for each provider you care about.
+4. On **Prompts**, adjust the main template and optional **Explain** / **PoC** prompts if you want.
+5. Click **Save Settings** (on Setup or Prompts) when you are done.
 
 ### Analyzing Requests/Responses
 #### Full Scan (Single Analysis)

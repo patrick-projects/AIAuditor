@@ -500,314 +500,194 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     }
 
 private void createMainTab() {
-       mainPanel = new JPanel(new BorderLayout());
+        mainPanel = new JPanel(new BorderLayout(8, 8));
 
-       // Create main control panel
-       JSplitPane controlPanel = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
-       controlPanel.setResizeWeight(0.5); // Distribute extra space equally
-       controlPanel.setDividerLocation(0.5); // Initial divider location
+        JTextArea quickStart = new JTextArea(
+                "Quick start — do this once:\n"
+                + "1) Paste at least one cloud API key and click Validate, and/or set Local LLM Endpoint and a local/… model.\n"
+                + "2) “AI Model (automatic)” = background work (Scanner issues, passive traffic, Proxy browser). "
+                + "“AI Model (manual)” = right‑click scans, Explain, PoC.\n"
+                + "3) Open “Automation & defaults” to choose when traffic is sent to the LLM; leave “passive all traffic” off unless you mean it.\n"
+                + "4) Click Save Settings on Setup or Prompts when you change keys, models, or text boxes.",
+                6, 72);
+        quickStart.setEditable(false);
+        quickStart.setLineWrap(true);
+        quickStart.setWrapStyleWord(true);
+        quickStart.setOpaque(false);
+        quickStart.setBorder(BorderFactory.createEmptyBorder(4, 8, 8, 8));
+        JPanel tipWrap = new JPanel(new BorderLayout());
+        tipWrap.add(quickStart, BorderLayout.CENTER);
+        tipWrap.setBorder(BorderFactory.createTitledBorder("Quick start"));
 
-       // Create left and right panels
-       JPanel leftPanel = new JPanel(new GridBagLayout());
-       leftPanel.setBorder(BorderFactory.createTitledBorder("AI Configuration")); // Add border
-       JPanel rightPanel = new JPanel(new GridBagLayout());
-       rightPanel.setBorder(BorderFactory.createTitledBorder("Settings")); // Add border
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.setBorder(BorderFactory.createEmptyBorder(0, 4, 4, 4));
+        tabs.addTab("Setup & providers", wrapTabScroll(buildSetupProvidersPanel()));
+        tabs.addTab("Automation & defaults", wrapTabScroll(buildAutomationDefaultsPanel()));
+        tabs.addTab("Prompts", wrapTabScroll(buildPromptsPanel()));
+        tabs.addTab("Advanced & status", wrapTabScroll(buildAdvancedStatusPanel()));
 
-        GridBagConstraints leftGbc = new GridBagConstraints();
-        leftGbc.fill = GridBagConstraints.HORIZONTAL;
-        leftGbc.insets = new Insets(5, 5, 5, 5);
+        mainPanel.add(tipWrap, BorderLayout.NORTH);
+        mainPanel.add(tabs, BorderLayout.CENTER);
 
-        GridBagConstraints rightGbc = new GridBagConstraints();
-        rightGbc.fill = GridBagConstraints.HORIZONTAL;
-        rightGbc.insets = new Insets(5, 5, 5, 5);
+        JScrollPane outerScroll = new JScrollPane(mainPanel);
+        outerScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        outerScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
 
-        // API Keys and Local Endpoint
-        int leftRow = 0;
-        addApiKeyField(leftPanel, leftGbc, leftRow++, "OpenAI API Key:", openaiKeyField = new JPasswordField(40), "openai");
+        new javax.swing.Timer(1000, e -> updateStatusPanel()).start();
 
-        // Changed to JTextArea for multiple keys
-        leftGbc.gridx = 0; leftGbc.gridy = leftRow;
-        leftPanel.add(new JLabel("Google API Keys (one per line):"), leftGbc);
-        geminiKeyField = new JTextArea(5, 40); // 5 rows for multiple keys
+        api.userInterface().registerSuiteTab("AI Auditor", outerScroll);
+    }
+
+    private JScrollPane wrapTabScroll(JPanel content) {
+        JScrollPane sp = new JScrollPane(content);
+        sp.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        sp.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        return sp;
+    }
+
+    private void addGridBagFiller(JPanel panel, GridBagConstraints gbc, int row) {
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = GridBagConstraints.REMAINDER;
+        gbc.weightx = 1.0;
+        gbc.weighty = 1.0;
+        gbc.fill = GridBagConstraints.BOTH;
+        panel.add(Box.createGlue(), gbc);
+        gbc.weighty = 0;
+        gbc.weightx = 0;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridwidth = 1;
+    }
+
+    private JPanel buildSetupProvidersPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 5, 5, 5);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        int row = 0;
+        addApiKeyField(panel, gbc, row++, "OpenAI API Key:", openaiKeyField = new JPasswordField(40), "openai");
+
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Google API Keys (one per line):"), gbc);
+        geminiKeyField = new JTextArea(5, 40);
         geminiKeyField.setLineWrap(true);
         geminiKeyField.setWrapStyleWord(true);
         JScrollPane geminiKeyScrollPane = new JScrollPane(geminiKeyField);
-        leftGbc.gridx = 1;
-        leftPanel.add(geminiKeyScrollPane, leftGbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(geminiKeyScrollPane, gbc);
         JButton validateGeminiButton = new JButton("Validate");
         validateGeminiButton.addActionListener(e -> validateApiKey("gemini"));
-        leftGbc.gridx = 2;
-        leftPanel.add(validateGeminiButton, leftGbc);
-        leftRow++;
-        addApiKeyField(leftPanel, leftGbc, leftRow++, "Anthropic API Key:", claudeKeyField = new JPasswordField(40), "claude");
-        addApiKeyField(leftPanel, leftGbc, leftRow++, "OpenRouter API Key:", openrouterKeyField = new JPasswordField(40), "openrouter");
-        addApiKeyField(leftPanel, leftGbc, leftRow++, "xAI (Grok) API Key:", xaiKeyField = new JPasswordField(40), "xai");
+        gbc.gridx = 2;
+        gbc.weightx = 0;
+        panel.add(validateGeminiButton, gbc);
+        row++;
 
-        // Local model endpoint and key
-        leftGbc.gridx = 0; leftGbc.gridy = leftRow;
+        addApiKeyField(panel, gbc, row++, "Anthropic API Key:", claudeKeyField = new JPasswordField(40), "claude");
+        addApiKeyField(panel, gbc, row++, "OpenRouter API Key:", openrouterKeyField = new JPasswordField(40), "openrouter");
+        addApiKeyField(panel, gbc, row++, "xAI (Grok) API Key:", xaiKeyField = new JPasswordField(40), "xai");
+
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
         JLabel localEndpointLabel = new JLabel("Local LLM Endpoint (LM Studio):");
         localEndpointLabel.setToolTipText("<html>LM Studio → Local Server → copy OpenAI base URL (e.g. <code>http://127.0.0.1:1234/v1</code>). "
                 + "Load a Gemma-class or similar GGUF model before starting the server.</html>");
-        leftPanel.add(localEndpointLabel, leftGbc);
+        panel.add(localEndpointLabel, gbc);
         localEndpointField = new JTextField(40);
         localEndpointField.setToolTipText(localEndpointLabel.getToolTipText());
-        leftGbc.gridx = 1;
-        leftPanel.add(localEndpointField, leftGbc);
-        leftRow++;
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(localEndpointField, gbc);
+        row++;
 
-        addApiKeyField(leftPanel, leftGbc, leftRow++, "Local LLM API Key:", localKeyField = new JPasswordField(40), "local");
+        addApiKeyField(panel, gbc, row++, "Local LLM API Key:", localKeyField = new JPasswordField(40), "local");
 
-        // Model selection (automatic vs manual investigation)
-        leftGbc.gridx = 0; leftGbc.gridy = leftRow;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
         JLabel autoModelLabel = new JLabel("AI Model (automatic audits):");
         autoModelLabel.setToolTipText("<html>Used for Scanner-issue auto-audits, Proxy/Repeater browser capture, and passive “all traffic”. "
                 + "Typical choice: <code>local/…</code> (LM Studio) or a small cloud model.</html>");
-        leftPanel.add(autoModelLabel, leftGbc);
+        panel.add(autoModelLabel, gbc);
         automaticAuditModelDropdown = new JComboBox<>();
         automaticAuditModelDropdown.setToolTipText(autoModelLabel.getToolTipText());
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(automaticAuditModelDropdown, gbc);
+        row++;
 
-        leftGbc.gridx = 1;
-        leftPanel.add(automaticAuditModelDropdown, leftGbc);
-        leftRow++;
-
-        leftGbc.gridx = 0; leftGbc.gridy = leftRow;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
         JLabel manualModelLabel = new JLabel("AI Model (manual / PoC / Explain):");
         manualModelLabel.setToolTipText("<html>Used for right-click scans, Explain me this, PoC generation, and context-menu issue deep-dive. "
                 + "Use a stronger model here if automatic audits use a small local model.</html>");
-        leftPanel.add(manualModelLabel, leftGbc);
+        panel.add(manualModelLabel, gbc);
         manualInvestigationModelDropdown = new JComboBox<>();
         manualInvestigationModelDropdown.setToolTipText(manualModelLabel.getToolTipText());
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(manualInvestigationModelDropdown, gbc);
+        row++;
 
-        leftGbc.gridx = 1;
-        leftPanel.add(manualInvestigationModelDropdown, leftGbc);
-        leftRow++;
+        resetModelsToDefault();
 
-        resetModelsToDefault(); // Initialize both dropdowns with default models
-
-        // Buttons for model management
         JPanel modelButtonsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JButton resetButton = new JButton("Reset to Default");
         resetButton.addActionListener(e -> resetModelsToDefault());
         modelButtonsPanel.add(resetButton);
-
         JButton fetchButton = new JButton("Get Latest Models");
         fetchButton.addActionListener(e -> fetchLatestModels());
         modelButtonsPanel.add(fetchButton);
 
-        // Model filtering
-        leftGbc.gridx = 0; leftGbc.gridy = ++leftRow;
-        leftPanel.add(new JLabel("Hide these Models (comma-separated):"), leftGbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Hide these Models (comma-separated):"), gbc);
         filterModelsField = new JTextField(40);
         filterModelsField.addKeyListener(new KeyAdapter() {
             public void keyReleased(KeyEvent e) {
                 applyModelFilter();
             }
         });
-        leftGbc.gridx = 1;
-        leftPanel.add(filterModelsField, leftGbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(filterModelsField, gbc);
 
-        leftGbc.gridx = 1;
-        leftGbc.gridy = ++leftRow;
-        leftPanel.add(modelButtonsPanel, leftGbc);
+        gbc.gridx = 1;
+        gbc.gridy = ++row;
+        panel.add(modelButtonsPanel, gbc);
 
-        // Custom Prompt Template
-        leftGbc.gridx = 0; leftGbc.gridy = ++leftRow;
-        leftPanel.add(new JLabel("Prompt Template:"), leftGbc);
-        promptTemplateArea = new JTextArea(10, 40); // Increased height for better visibility
-        promptTemplateArea.setLineWrap(true);
-        promptTemplateArea.setWrapStyleWord(true);
-        JScrollPane promptScrollPane = new JScrollPane(promptTemplateArea);
-        leftGbc.gridx = 1;
-        leftPanel.add(promptScrollPane, leftGbc);
-        leftRow++;
-
-        
-                // Save Button
         saveButton = new JButton("Save Settings");
         saveButton.addActionListener(e -> saveSettings());
-        leftGbc.gridx = 1; 
-        leftGbc.gridy = ++leftRow;
-        leftPanel.add(saveButton, leftGbc);
+        gbc.gridx = 1;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
+        panel.add(saveButton, gbc);
+        gbc.gridwidth = 1;
 
-        // Prompt Templates Panel
-        leftGbc.gridx = 0; 
-        leftGbc.gridy = ++leftRow; 
-        leftGbc.gridwidth = 2; // Span across 2 columns
-        JPanel templateButtonsPanel = createTemplateButtonsPanel();
-        leftPanel.add(templateButtonsPanel, leftGbc);
-        leftGbc.gridwidth = 1; // reset
+        addGridBagFiller(panel, gbc, ++row);
+        return panel;
+    }
 
-        int rightRow = 0;
+    private JPanel buildAutomationDefaultsPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 5, 5, 5);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
 
-   // row has already been incremented
-   rightGbc.gridx = 0; rightGbc.gridy = rightRow;
-   rightPanel.add(new JLabel("Max Retries:"), rightGbc);
-   retriesField = new JTextField(20);
-   retriesField.setText("3"); // default
-   rightGbc.gridx = 1;
-   rightPanel.add(retriesField, rightGbc);
-
-   rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-   rightPanel.add(new JLabel("Retry Delay (ms):"), rightGbc);
-   retryDelayField = new JTextField(20);
-   retryDelayField.setText("1000");
-   rightGbc.gridx = 1;
-   rightPanel.add(retryDelayField, rightGbc);
-
-   rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-   rightPanel.add(new JLabel("Max token size:"), rightGbc);
-   maxChunkSizeField = new JTextField(20);
-   maxChunkSizeField.setText("16384");
-   rightGbc.gridx = 1;
-   rightPanel.add(maxChunkSizeField, rightGbc);
-
-   // Add token size buttons
-   JPanel tokenButtonsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-   String[] tokenSizes = {"16K", "64K", "100K", "1M"};
-   for (String size : tokenSizes) {
-       JButton button = new JButton(size);
-       button.addActionListener(e -> {
-			String value = size.replace("M", "000000")
-							   .replace("K", "000");
-           maxChunkSizeField.setText(value);
-       });
-       tokenButtonsPanel.add(button);
-   }
-   rightGbc.gridx = 1;
-   rightGbc.gridy = ++rightRow;
-   rightPanel.add(tokenButtonsPanel, rightGbc);
-   rightRow++;
-
-   rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-   rightPanel.add(new JLabel("Rate Limit (requests):"), rightGbc);
-   rateLimitCountField = new JTextField(20);
-   rateLimitCountField.setText("50");
-   rightGbc.gridx = 1;
-   rightPanel.add(rateLimitCountField, rightGbc);
-
-   rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-   rightPanel.add(new JLabel("Rate Window (sec):"), rightGbc);
-   rateLimitWindowField = new JTextField(20);
-   rateLimitWindowField.setText("60");
-   rightGbc.gridx = 1;
-   rightPanel.add(rateLimitWindowField, rightGbc);
-
-   rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-   rightPanel.add(new JLabel("Batch Size:"), rightGbc);
-   batchSizeField = new JTextField(20);
-   batchSizeField.setText("5");
-   rightGbc.gridx = 1;
-   rightPanel.add(batchSizeField, rightGbc);
-
-        // Logging Options
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2; // Span two columns for the title
-        rightPanel.add(new JLabel("Logging Level:"), rightGbc);
-        rightGbc.gridwidth = 1; // Reset gridwidth
-
-        JPanel loggingPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        detailedLoggingRadio = new JRadioButton("Detailed logging");
-        detailedOnelinerLoggingRadio = new JRadioButton("Detailed logging oneliner");
-        limitedLoggingRadio = new JRadioButton("Limited logging");
-
-        loggingButtonGroup = new ButtonGroup();
-        loggingButtonGroup.add(detailedLoggingRadio);
-        loggingButtonGroup.add(detailedOnelinerLoggingRadio);
-        loggingButtonGroup.add(limitedLoggingRadio);
-
-        loggingPanel.add(detailedLoggingRadio);
-        loggingPanel.add(detailedOnelinerLoggingRadio);
-        loggingPanel.add(limitedLoggingRadio);
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2; // Span two columns for the radio buttons
-        rightPanel.add(loggingPanel, rightGbc);
-        rightGbc.gridwidth = 1; // Reset gridwidth
-
-        // Add action listeners for logging radio buttons
-        detailedLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.DETAILED);
-        detailedOnelinerLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.DETAILED_ONELINER);
-        limitedLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.LIMITED);
-
-        // Proxy Settings
-        // Explain Me This Custom Prompt
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Prompt for 'Explain Me This' :"), rightGbc);
-        explainMeThisPromptArea = new JTextArea(5, 20); // 5 rows for better visibility
-        explainMeThisPromptArea.setLineWrap(true);
-        explainMeThisPromptArea.setWrapStyleWord(true);
-        JScrollPane explainMeThisScrollPane = new JScrollPane(explainMeThisPromptArea);
-		explainMeThisPromptArea.setText("Explain the following input from a security and penetration testing perspective as if you are a senior penetration tester - describe what it is, what it can do, and suggest possible checks or exploitation opportunities. Explain me briefly.");
-
-        rightGbc.gridx = 1;
-        rightPanel.add(explainMeThisScrollPane, rightGbc);
-        rightRow++;
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Prompt for investigate / PoC (Burp-AI–style):"), rightGbc);
-        pocPromptArea = new JTextArea(6, 20);
-        pocPromptArea.setLineWrap(true);
-        pocPromptArea.setWrapStyleWord(true);
-        pocPromptArea.setText(getDefaultPocPrompt());
-        rightGbc.gridx = 1;
-        rightPanel.add(new JScrollPane(pocPromptArea), rightGbc);
-        rightRow++;
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Proxy (IP:Port):"), rightGbc);
-        proxyField = new JTextField(20);
-        proxyField.setToolTipText("<html>Optional HTTP proxy for <b>this extension’s</b> outbound API calls (OpenAI, Gemini, etc.). "
-                + "Traffic to <b>localhost</b>, <b>127.0.0.1</b>, and your <b>Local LLM Endpoint</b> host is sent <b>direct</b> "
-                + "so LM Studio still works when Burp uses a separate upstream proxy for browsing.</html>");
-        rightGbc.gridx = 1;
-        rightPanel.add(proxyField, rightGbc);
-        rightRow++;
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
-        rightPanel.add(new JLabel("<html><b>Default model</b> when <b>AI Model = Default</b> (full <code>provider/id</code> or short id):</html>"), rightGbc);
-        rightGbc.gridwidth = 1;
-
-        defaultOpenaiModelField = new JTextField("gpt-4o-mini", 24);
-        defaultGeminiModelField = new JTextField("gemini-2.0-flash-lite", 24);
-        defaultClaudeModelField = new JTextField("claude-3-5-haiku-latest", 24);
-        defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
-        defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
-        defaultLocalModelField = new JTextField("local-llm (LM Studio)", 24);
-        defaultLocalModelField.setToolTipText("<html>Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
-                + "Gemma 3 / newer Gemma variants are a good default on Apple Silicon.</html>");
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("OpenAI:"), rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultOpenaiModelField, rightGbc);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Gemini:"), rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultGeminiModelField, rightGbc);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Claude:"), rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultClaudeModelField, rightGbc);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("OpenRouter:"), rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultOpenrouterModelField, rightGbc);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("xAI:"), rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultXaiModelField, rightGbc);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        JLabel defaultLocalLabel = new JLabel("Local LLM:");
-        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
-        rightPanel.add(defaultLocalLabel, rightGbc);
-        rightGbc.gridx = 1;
-        rightPanel.add(defaultLocalModelField, rightGbc);
-
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
-        rightPanel.add(new JLabel("<html><b>Automatic AI audits</b> — control when traffic is sent to the LLM (manual right-click scans always work):</html>"), rightGbc);
-        rightGbc.gridwidth = 1;
+        int row = 0;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1.0;
+        panel.add(new JLabel("<html><b>Automatic audits</b> — when to send traffic to the LLM in the background. "
+                + "Right‑click scans always work regardless of these checkboxes.</html>"), gbc);
+        gbc.gridwidth = 1;
 
         passiveAiOnScannerIssuesCheckbox = new JCheckBox("When Burp reports a Scanner issue, queue an AI audit (recommended)");
         passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
@@ -816,23 +696,26 @@ private void createMainTab() {
         proxyBrowserLocalAiCheckbox = new JCheckBox("Auto-audit browser (Proxy) → local LLM (LM Studio / Gemma-class)");
         proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
         proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP);
-        passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (Target scope)");
-        passiveAiInScopeCheckbox.setSelected(true);
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
-        rightPanel.add(passiveAiOnScannerIssuesCheckbox, rightGbc);
-        rightGbc.gridy = ++rightRow;
-        rightPanel.add(passiveAiAllTrafficCheckbox, rightGbc);
-        rightGbc.gridy = ++rightRow;
-        rightPanel.add(proxyBrowserLocalAiCheckbox, rightGbc);
         proxyIncludeRepeaterCheckbox = new JCheckBox("Also auto-audit Repeater responses (same rules as Proxy)");
         proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
         proxyIncludeRepeaterCheckbox.setToolTipText("Queues LLM audits for HTTP responses sent from Repeater, not only the browser Proxy.");
-        rightGbc.gridy = ++rightRow;
-        rightPanel.add(proxyIncludeRepeaterCheckbox, rightGbc);
-        rightGbc.gridy = ++rightRow;
-        rightPanel.add(passiveAiInScopeCheckbox, rightGbc);
-        rightGbc.gridwidth = 1;
+        passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (Target scope)");
+        passiveAiInScopeCheckbox.setSelected(passiveAiInScopeOnly);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
+        panel.add(passiveAiOnScannerIssuesCheckbox, gbc);
+        gbc.gridy = ++row;
+        panel.add(passiveAiAllTrafficCheckbox, gbc);
+        gbc.gridy = ++row;
+        panel.add(proxyBrowserLocalAiCheckbox, gbc);
+        gbc.gridy = ++row;
+        panel.add(proxyIncludeRepeaterCheckbox, gbc);
+        gbc.gridy = ++row;
+        panel.add(passiveAiInScopeCheckbox, gbc);
+        gbc.gridwidth = 1;
+
         passiveAiOnScannerIssuesCheckbox.addItemListener(e -> {
             boolean on = e.getStateChange() == ItemEvent.SELECTED;
             passiveAiOnScannerIssues = on;
@@ -859,26 +742,258 @@ private void createMainTab() {
             api.persistence().preferences().setBoolean(PREF_PREFIX + "passive_ai_in_scope", on);
         });
 
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
         JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 8, 42);
         proxySetupGuideArea.setEditable(false);
         proxySetupGuideArea.setLineWrap(true);
         proxySetupGuideArea.setWrapStyleWord(true);
-        proxySetupGuideArea.setBackground(rightPanel.getBackground());
-        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM setup (hover checkbox above for summary)"));
+        proxySetupGuideArea.setBackground(UIManager.getColor("Panel.background"));
+        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM setup (LM Studio)"));
         proxySetupGuideArea.setToolTipText("Step-by-step: LM Studio + Gemma-class model + Proxy-only auto-audits.");
-        rightPanel.add(new JScrollPane(proxySetupGuideArea), rightGbc);
-        rightGbc.gridwidth = 1;
+        panel.add(new JScrollPane(proxySetupGuideArea), gbc);
+        gbc.gridwidth = 1;
 
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightPanel.add(new JLabel("Passive max response (KB):"), rightGbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Passive max response (KB):"), gbc);
         passiveMaxBodyKbField = new JTextField(String.valueOf(DEFAULT_PASSIVE_MAX_BODY_KB), 8);
-        rightGbc.gridx = 1;
-        rightPanel.add(passiveMaxBodyKbField, rightGbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(passiveMaxBodyKbField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        JLabel proxyLabel = new JLabel("Proxy for cloud API calls (IP:Port):");
+        proxyLabel.setToolTipText("<html>Optional HTTP proxy for <b>this extension’s</b> outbound API calls. "
+                + "Localhost, 127.0.0.1, and your Local LLM host stay <b>direct</b>.</html>");
+        panel.add(proxyLabel, gbc);
+        proxyField = new JTextField(24);
+        proxyField.setToolTipText("<html>Optional HTTP proxy for <b>this extension’s</b> outbound API calls (OpenAI, Gemini, etc.). "
+                + "Traffic to <b>localhost</b>, <b>127.0.0.1</b>, and your <b>Local LLM Endpoint</b> host is sent <b>direct</b> "
+                + "so LM Studio still works when Burp uses a separate upstream proxy for browsing.</html>");
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(proxyField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1.0;
+        panel.add(new JLabel("<html><b>Default model</b> when a dropdown shows <b>Default</b> "
+                + "(full <code>provider/id</code> or short id per provider):</html>"), gbc);
+        gbc.gridwidth = 1;
+
+        defaultOpenaiModelField = new JTextField("gpt-4o-mini", 24);
+        defaultGeminiModelField = new JTextField("gemini-2.0-flash-lite", 24);
+        defaultClaudeModelField = new JTextField("claude-3-5-haiku-latest", 24);
+        defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
+        defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
+        defaultLocalModelField = new JTextField("local-llm (LM Studio)", 24);
+        defaultLocalModelField.setToolTipText("<html>Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
+                + "Gemma 3 / newer Gemma variants are a good default on Apple Silicon.</html>");
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("OpenAI:"), gbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(defaultOpenaiModelField, gbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Gemini:"), gbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(defaultGeminiModelField, gbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("Claude:"), gbc);
+        gbc.gridx = 1;
+        panel.add(defaultClaudeModelField, gbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("OpenRouter:"), gbc);
+        gbc.gridx = 1;
+        panel.add(defaultOpenrouterModelField, gbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("xAI:"), gbc);
+        gbc.gridx = 1;
+        panel.add(defaultXaiModelField, gbc);
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        JLabel defaultLocalLabel = new JLabel("Local LLM:");
+        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
+        panel.add(defaultLocalLabel, gbc);
+        gbc.gridx = 1;
+        panel.add(defaultLocalModelField, gbc);
+
+        addGridBagFiller(panel, gbc, ++row);
+        return panel;
+    }
+
+    private JPanel buildPromptsPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 5, 5, 5);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        int row = 0;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1.0;
+        panel.add(new JLabel("<html><b>Main scan prompt</b> — used for most LLM audits. Use the snippet buttons to paste common sections.</html>"), gbc);
+
+        gbc.gridy = ++row;
+        promptTemplateArea = new JTextArea(10, 50);
+        promptTemplateArea.setLineWrap(true);
+        promptTemplateArea.setWrapStyleWord(true);
+        panel.add(new JScrollPane(promptTemplateArea), gbc);
+
+        gbc.gridy = ++row;
+        gbc.fill = GridBagConstraints.NONE;
+        JButton savePromptsTab = new JButton("Save Settings");
+        savePromptsTab.addActionListener(e -> saveSettings());
+        JPanel saveRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        saveRow.add(savePromptsTab);
+        panel.add(saveRow, gbc);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        gbc.gridy = ++row;
+        JPanel templateButtonsPanel = createTemplateButtonsPanel();
+        panel.add(templateButtonsPanel, gbc);
+
+        gbc.gridy = ++row;
+        panel.add(new JLabel("<html><b>Explain Me This</b> — right‑click context menu prompt:</html>"), gbc);
+        explainMeThisPromptArea = new JTextArea(5, 50);
+        explainMeThisPromptArea.setLineWrap(true);
+        explainMeThisPromptArea.setWrapStyleWord(true);
+        explainMeThisPromptArea.setText("Explain the following input from a security and penetration testing perspective as if you are a senior penetration tester - describe what it is, what it can do, and suggest possible checks or exploitation opportunities. Explain me briefly.");
+        gbc.gridy = ++row;
+        panel.add(new JScrollPane(explainMeThisPromptArea), gbc);
+
+        gbc.gridy = ++row;
+        panel.add(new JLabel("<html><b>Investigate / PoC</b> — hypothesis → demonstrable issue:</html>"), gbc);
+        pocPromptArea = new JTextArea(6, 50);
+        pocPromptArea.setLineWrap(true);
+        pocPromptArea.setWrapStyleWord(true);
+        pocPromptArea.setText(getDefaultPocPrompt());
+        gbc.gridy = ++row;
+        panel.add(new JScrollPane(pocPromptArea), gbc);
+
+        gbc.gridwidth = 1;
+        addGridBagFiller(panel, gbc, ++row);
+        return panel;
+    }
+
+    private JPanel buildAdvancedStatusPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 5, 5, 5);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        int row = 0;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        panel.add(new JLabel("Max Retries:"), gbc);
+        retriesField = new JTextField(20);
+        retriesField.setText("3");
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(retriesField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Retry Delay (ms):"), gbc);
+        retryDelayField = new JTextField(20);
+        retryDelayField.setText("1000");
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(retryDelayField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.weightx = 0;
+        panel.add(new JLabel("Max token size:"), gbc);
+        maxChunkSizeField = new JTextField(20);
+        maxChunkSizeField.setText("16384");
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        panel.add(maxChunkSizeField, gbc);
+
+        JPanel tokenButtonsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        String[] tokenSizes = {"16K", "64K", "100K", "1M"};
+        for (String size : tokenSizes) {
+            JButton button = new JButton(size);
+            button.addActionListener(e -> {
+                String value = size.replace("M", "000000").replace("K", "000");
+                maxChunkSizeField.setText(value);
+            });
+            tokenButtonsPanel.add(button);
+        }
+        gbc.gridx = 1;
+        gbc.gridy = ++row;
+        panel.add(tokenButtonsPanel, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("Rate Limit (requests):"), gbc);
+        rateLimitCountField = new JTextField(20);
+        rateLimitCountField.setText("50");
+        gbc.gridx = 1;
+        panel.add(rateLimitCountField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("Rate Window (sec):"), gbc);
+        rateLimitWindowField = new JTextField(20);
+        rateLimitWindowField.setText("60");
+        gbc.gridx = 1;
+        panel.add(rateLimitWindowField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        panel.add(new JLabel("Batch Size:"), gbc);
+        batchSizeField = new JTextField(20);
+        batchSizeField.setText("5");
+        gbc.gridx = 1;
+        panel.add(batchSizeField, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1.0;
+        panel.add(new JLabel("Logging Level:"), gbc);
+
+        JPanel loggingPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        detailedLoggingRadio = new JRadioButton("Detailed logging");
+        detailedOnelinerLoggingRadio = new JRadioButton("Detailed logging oneliner");
+        limitedLoggingRadio = new JRadioButton("Limited logging");
+        loggingButtonGroup = new ButtonGroup();
+        loggingButtonGroup.add(detailedLoggingRadio);
+        loggingButtonGroup.add(detailedOnelinerLoggingRadio);
+        loggingButtonGroup.add(limitedLoggingRadio);
+        loggingPanel.add(detailedLoggingRadio);
+        loggingPanel.add(detailedOnelinerLoggingRadio);
+        loggingPanel.add(limitedLoggingRadio);
+
+        gbc.gridy = ++row;
+        panel.add(loggingPanel, gbc);
+        gbc.gridwidth = 1;
+
+        detailedLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.DETAILED);
+        detailedOnelinerLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.DETAILED_ONELINER);
+        limitedLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.LIMITED);
 
         JPanel statusPanel = new JPanel(new GridLayout(4, 1));
-        statusPanel.setBorder(BorderFactory.createTitledBorder("Status")); // Add border
+        statusPanel.setBorder(BorderFactory.createTitledBorder("Task queue"));
         activeTasksLabel = new JLabel("Active Tasks: 0");
         queuedTasksLabel = new JLabel("Queued Tasks: 0");
         completedTasksLabel = new JLabel("Completed Tasks: 0");
@@ -886,47 +1001,19 @@ private void createMainTab() {
         statusPanel.add(queuedTasksLabel);
         statusPanel.add(completedTasksLabel);
 
-        // Add status panel to the right panel
-        rightGbc.gridx = 0; rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
-        rightPanel.add(statusPanel, rightGbc);
-        rightGbc.gridwidth = 1;
+        gbc.gridx = 0;
+        gbc.gridy = ++row;
+        gbc.gridwidth = 2;
+        panel.add(statusPanel, gbc);
 
-        // Add a button to test Gemini key cycling
         JButton testGeminiCyclingButton = new JButton("Test Gemini Key Cycling");
         testGeminiCyclingButton.addActionListener(e -> testGeminiKeyCycling());
-        rightGbc.gridx = 0;
-        rightGbc.gridy = ++rightRow;
-        rightGbc.gridwidth = 2;
-        rightPanel.add(testGeminiCyclingButton, rightGbc);
-        rightGbc.gridwidth = 1;
+        gbc.gridy = ++row;
+        panel.add(testGeminiCyclingButton, gbc);
+        gbc.gridwidth = 1;
 
-
-		new javax.swing.Timer(1000, e -> updateStatusPanel()).start();
-
-        // Create scroll panes for left and right panels
-        JScrollPane leftScrollPane = new JScrollPane(leftPanel);
-        leftScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
-        leftScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-
-        JScrollPane rightScrollPane = new JScrollPane(rightPanel);
-        rightScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
-        rightScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-
-        // Add left and right panels to the control panel
-        controlPanel.setLeftComponent(leftScrollPane);
-        controlPanel.setRightComponent(rightScrollPane);
-
-        // Add the control panel to the main panel
-        mainPanel.add(controlPanel, BorderLayout.CENTER);
-
-        // Make the entire UI scrollable
-        JScrollPane scrollPane = new JScrollPane(mainPanel);
-        scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
-        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-
-        // Register the tab
-        api.userInterface().registerSuiteTab("AI Auditor", scrollPane);
+        addGridBagFiller(panel, gbc, ++row);
+        return panel;
     }
 
 	private void updateStatusPanel() {
