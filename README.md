@@ -12,7 +12,7 @@ AI Auditor is a **Burp Suite Professional / Enterprise** extension that sends HT
 
 **How it fits into Burp:** passive scan integration, optional audits when Burp reports Scanner issues, optional high-level review of in-scope traffic, and optional **Proxy** (and **Repeater**) response capture when using a **local** model—so day-to-day browsing can be analyzed without routing full Scanner/crawler volume through the LLM. Settings, API keys, and prompts persist across restarts.
 
-**Install:** use the pre-built JAR under [`releases/`](https://github.com/patrick-projects/AIAuditor/raw/main/releases/ai-auditor-jar-with-dependencies.jar) or a [GitHub Release](https://github.com/patrick-projects/AIAuditor/releases/latest); load it under **Extensions → Add → Java**.
+**Install:** download the pre-built fat JAR from [`releases/ai-auditor-jar-with-dependencies.jar`](https://github.com/patrick-projects/AIAuditor/raw/main/releases/ai-auditor-jar-with-dependencies.jar) (raw link) or a [GitHub Release](https://github.com/patrick-projects/AIAuditor/releases/latest). In Burp: **Extender** → **Extensions** → **Add** → extension type **Java** → select the JAR → **Next** (leave options default unless you know you need otherwise).
 
 ### Issues Reported by AI Auditor
 ![ScannerReport](images/ScannerReport.png)
@@ -29,7 +29,7 @@ AI Auditor is a **Burp Suite Professional / Enterprise** extension that sends HT
 <details>
 <summary><strong>Local LLM (Ollama terminal or LM Studio)</strong></summary>
 
-**Ollama + Gemma 4 (Apple Silicon, e.g. M4 Max)** — copy-paste in Terminal:
+**Ollama + Gemma 4 26B** — for **M4 Max with 64 GB RAM**, copy-paste in Terminal:
 
 ```bash
 brew install ollama
@@ -39,23 +39,20 @@ ollama serve
 In a second terminal (leave `ollama serve` running):
 
 ```bash
-ollama pull gemma4:e4b
-# Edge-sized Gemma 4 (~effective 4B), good for high-volume bulk audits.
-# On M4 Max with spare RAM, try: ollama pull gemma4:26b
-# Lighter: ollama pull gemma4:e2b
+ollama pull gemma4:26b
 ```
 
-Tags are listed at [ollama.com/library/gemma4](https://ollama.com/library/gemma4). If `pull` fails, upgrade Ollama to the latest version.
+If `pull` fails, upgrade Ollama to the latest version. Model details: [ollama.com/library/gemma4](https://ollama.com/library/gemma4).
 
-In **AI Auditor → Connect**: set **Local LLM URL** to `http://127.0.0.1:11434/v1`, set the **bulk** model to `local/gemma4:e4b` (or whatever name you pulled, e.g. `local/gemma4:26b`), **Validate**, **Save Settings**.
+In **AI Auditor → Connect**: set **Local LLM URL** to `http://127.0.0.1:11434/v1`, click **Validate** (the button beside the URL — checks `GET /v1/models`), set **Cheap Local LLM (Bulk Proxied Traffic)** to `local/gemma4:26b`, optionally set **Premium Model for PoCs**, click **Get Latest Models** if the dropdown is empty, then **Save Settings**.
 
 **LM Studio (GUI)**
 
 1. Run LM Studio and ensure its IP + port are reachable from Burp Suite.  
 2. Load a model in LM Studio for request/response analysis.  
 3. Enter the LM Studio URL in **Burp Suite → AI Auditor → Connect** (often `http://127.0.0.1:1234/v1`).  
-4. Click **Validate**—results appear in **Event Log** (lower-left).  
-5. Choose a **local/…** model in the bulk (and/or manual) dropdown.  
+4. Click **Validate** next to **Local LLM URL** — results appear in **Event Log** (lower-left).  
+5. Choose a **local/…** model in **Cheap Local LLM (Bulk Proxied Traffic)** and/or **Premium Model for PoCs**.  
 6. (Optional) Set the proxy to `127.0.0.1:8080` to inspect traffic.  
 7. Highlight a request or text → **Right-click → Extensions → AI Auditor**.  
 8. View findings in **Target → Issues** or the **Event Log**.
@@ -266,17 +263,17 @@ mvn clean package
 The compiled JAR will be available at `target/ai-auditor-1.2.0-jar-with-dependencies.jar`.
 
 ## Installation: Loading JAR in Burp Suite (Recommended)
-1. Use a JAR from **[Releases](https://github.com/patrick-projects/AIAuditor/releases/latest)** (see **Pre-built JAR** above), or build from source and use the file under `target/`.
-2. Open **Burp Suite Professional Edition** or **Burp Suite Enterprise Edition**.
-3. Navigate to the **Extensions** tab.
-4. Click **Add**, select **Java** as the extension type, and upload the `JAR` file.
-5. Click **Next** to load the extension.
+1. Download **`ai-auditor-jar-with-dependencies.jar`** from [`releases/`](https://github.com/patrick-projects/AIAuditor/tree/main/releases) (or the [latest GitHub Release](https://github.com/patrick-projects/AIAuditor/releases/latest)), or build from source and use `target/ai-auditor-*-jar-with-dependencies.jar`.
+2. Open **Burp Suite Professional** or **Enterprise** (Community is not supported; see FAQ).
+3. Open the **Extender** tab → **Extensions** sub-tab.
+4. Click **Add**, choose extension type **Java**, select the downloaded JAR, then **Next** to load.
+5. Confirm **AI Auditor** appears under **Loaded** and open the **AI Auditor** tab in the main Burp window.
 
 ## Usage
 ### Initial Setup
 1. Open the **AI Auditor** suite tab. Use the sub-tabs in order: **Connect** (keys and models), **Cheap local bulk** (high-volume automation — prefer LM Studio / cheap models), **Prompts** (optional wording), **Tuning** (retries and logging — skip at first).
-2. On **Connect**, add API key(s) (OpenAI, Gemini, Claude, OpenRouter, xAI) and/or a **Local LLM** URL, then **Validate**.
-3. Click **Get Latest Models**, pick the **bulk proxied traffic** and **PoC** model slots, then **Save Settings**.
+2. On **Connect**, add API key(s) and/or a **Local LLM URL**. Use **Validate** next to each cloud key row, or **Validate** next to **Local LLM URL** for Ollama/LM Studio (optional **Local LLM API Key** if your server requires it).
+3. Click **Get Latest Models**, pick **Cheap Local LLM (Bulk Proxied Traffic)** and **Premium Model for PoCs**, then **Save Settings**.
 4. On **Cheap local bulk**, leave defaults unless you want Proxy/local browser analysis or full passive traffic; avoid premium cloud APIs in the bulk slot here or costs add up quickly.
 5. **Prompts** and **Tuning** are optional until you need them.
 

@@ -14,4 +14,4 @@ git add releases/ai-auditor-jar-with-dependencies.jar
 
 **CI:** Pushes to `main` still upload a workflow artifact **ai-auditor-burp-jar** under Actions. Tagged releases also attach the same fat JAR on the Releases page.
 
-Load in Burp: **Extensions → Add → Java →** select the JAR.
+Load in Burp: **Extender → Extensions → Add →** extension type **Java** → select the JAR → **Next**.

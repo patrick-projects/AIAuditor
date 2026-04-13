@@ -137,28 +137,23 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
             + "Gemma 4 (Ollama or GGUF in LM Studio) is a strong default on Apple Silicon.";
 
     private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
-            "— Terminal path: Ollama + Gemma 4 (good default on Apple Silicon, e.g. M4 Max) —\n\n"
+            "— Terminal path: Ollama + Gemma 4 26B (M4 Max with 64 GB RAM) —\n\n"
             + "Install and start Ollama (macOS, Homebrew):\n"
             + "  brew install ollama\n"
             + "  ollama serve\n"
             + "(Leave that running, or use: brew services start ollama)\n"
-            + "Use a second terminal for the pull command below.\n\n"
-            + "Pull Gemma 4 (pick one — see ollama.com/library/gemma4):\n"
-            + "  ollama pull gemma4:e4b\n"
-            + "  # Fast edge-sized model (~effective 4B) for high-volume bulk audits.\n"
-            + "  # On M4 Max with headroom, try instead:\n"
-            + "  # ollama pull gemma4:26b\n"
-            + "  # Lighter option:\n"
-            + "  # ollama pull gemma4:e2b\n"
-            + "If pull fails, update Ollama to the latest version (Gemma 4 needs a recent build).\n\n"
-            + "In AI Auditor → Connect → paste and Save:\n"
+            + "Use a second terminal for:\n"
+            + "  ollama pull gemma4:26b\n"
+            + "If pull fails, update Ollama to the latest version.\n\n"
+            + "In AI Auditor → Connect:\n"
             + "  Local LLM URL:  http://127.0.0.1:11434/v1\n"
-            + "  Bulk model:     local/gemma4:e4b   (must match the name from \"ollama list\" / your pull)\n"
-            + "Click Validate, Get Latest Models if needed, then Save Settings.\n\n"
+            + "  Click Validate (next to the URL).\n"
+            + "  Cheap Local LLM slot:  local/gemma4:26b\n"
+            + "  Get Latest Models if the dropdown is empty, then Save Settings.\n\n"
             + "— GUI path: LM Studio —\n\n"
-            + "1) Install LM Studio (lmstudio.ai), open Search, download a Gemma 4 instruction-tuned GGUF when available.\n"
+            + "1) Install LM Studio (lmstudio.ai), open Search, load Gemma 4 26B (or similar) if you prefer the GUI over Ollama.\n"
             + "2) Load the model → Local Server → Start Server (URL is often http://127.0.0.1:1234/v1).\n"
-            + "3) Paste that URL into Local LLM URL on Connect; set the bulk slot to local/<loaded model id>; Save.\n"
+            + "3) Paste URL into Local LLM URL on Connect; Validate (next to URL); bulk slot local/<loaded model id>; Save.\n"
             + "4) On this tab, enable \"Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)\" "
             + "if you want browser Proxy traffic analyzed.\n"
             + "5) Optional: Burp proxy at 127.0.0.1:8080 while this extension still uses the LM URL above — "
@@ -583,7 +578,7 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel connectHint = new JLabel("Add one cloud key or a local LM Studio URL, click Validate, then Get Latest Models and Save Settings.");
+        JLabel connectHint = new JLabel("Add one cloud key or a local LLM URL, click Validate (per provider or next to Local LLM URL), then Get Latest Models and Save Settings.");
         rgbc.gridy = 0;
         root.add(connectHint, rgbc);
 
@@ -630,9 +625,26 @@ private void createMainTab() {
         gbc.gridx = 1;
         gbc.weightx = 1.0;
         cred.add(localEndpointField, gbc);
+        JButton validateLocalUrlButton = new JButton("Validate");
+        validateLocalUrlButton.setToolTipText("GET /v1/models on this base URL (uses optional API key below if set).");
+        validateLocalUrlButton.addActionListener(e -> validateLocalLlmEndpoint());
+        gbc.gridx = 2;
+        gbc.weightx = 0;
+        cred.add(validateLocalUrlButton, gbc);
         row++;
 
-        addApiKeyField(cred, gbc, row++, "Local LLM API Key (if required):", localKeyField = new JPasswordField(40), "local");
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
+        gbc.gridwidth = 1;
+        cred.add(new JLabel("Local LLM API Key (if required):"), gbc);
+        localKeyField = new JPasswordField(40);
+        gbc.gridx = 1;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1.0;
+        cred.add(localKeyField, gbc);
+        gbc.gridwidth = 1;
+        row++;
 
         rgbc.gridy = 1;
         root.add(cred, rgbc);
@@ -808,7 +820,7 @@ private void createMainTab() {
         proxySetupGuideArea.setWrapStyleWord(true);
         proxySetupGuideArea.setBackground(UIManager.getColor("Panel.background"));
         proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM — Ollama (terminal) or LM Studio"));
-        proxySetupGuideArea.setToolTipText("Copy-paste Ollama commands for Gemma 4 on Apple Silicon, or follow LM Studio steps.");
+        proxySetupGuideArea.setToolTipText("Ollama: gemma4:26b for M4 Max / 64 GB RAM. Or use LM Studio steps below.");
         rgbc.gridy = 2;
         root.add(new JScrollPane(proxySetupGuideArea), rgbc);
 
@@ -1705,6 +1717,31 @@ private void createMainTab() {
     }
     
     
+    /**
+     * Checks OpenAI-compatible {@code GET {base}/models} (LM Studio, Ollama, etc.). Optional bearer uses Local LLM API Key.
+     */
+    private void validateLocalLlmEndpoint() {
+        try {
+            String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
+            if (base.isEmpty()) {
+                api.logging().raiseErrorEvent("Enter Local LLM URL first (e.g. http://127.0.0.1:11434/v1).");
+                return;
+            }
+            String apiKey = localKeyField != null ? new String(localKeyField.getPassword()).trim() : "";
+            String normalized = base.replaceAll("/+$", "");
+            String endpoint = normalized + "/models";
+            log("Validating local LLM: GET " + endpoint, LogCategory.GENERAL);
+            boolean ok = validateApiKeyWithEndpoint(apiKey, endpoint, "", "local");
+            if (ok) {
+                api.logging().raiseInfoEvent("Local LLM URL is valid (/models responded OK).");
+            } else {
+                api.logging().raiseErrorEvent("Local LLM URL validation failed — check the URL, that the server is running, and the optional API key.");
+            }
+        } catch (Exception e) {
+            showError("Local LLM validation error", e);
+        }
+    }
+
     private void validateApiKey(String provider) {
         String apiKey = "";
         String endpoint = "";
@@ -1753,11 +1790,9 @@ private void createMainTab() {
                     break;
 
                 case "local":
-                    apiKey = localKeyField.getText();
-                    endpoint = localEndpointField.getText() + "/models";
-                    break;
-                
-    
+                    validateLocalLlmEndpoint();
+                    return;
+
                 default:
                     JOptionPane.showMessageDialog(mainPanel, "Unknown provider: " + provider, "Validation Error", JOptionPane.ERROR_MESSAGE);
                     return;
