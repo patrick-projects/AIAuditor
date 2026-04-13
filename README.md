@@ -27,13 +27,35 @@ AI Auditor is a **Burp Suite Professional / Enterprise** extension that sends HT
 ### Updates in AI Auditor v1.1 with screenshots
 
 <details>
-<summary><strong>Local LLM (LM Studio)</strong></summary>
+<summary><strong>Local LLM (Ollama terminal or LM Studio)</strong></summary>
+
+**Ollama + Gemma 4 (Apple Silicon, e.g. M4 Max)** — copy-paste in Terminal:
+
+```bash
+brew install ollama
+ollama serve
+```
+
+In a second terminal (leave `ollama serve` running):
+
+```bash
+ollama pull gemma4:e4b
+# Edge-sized Gemma 4 (~effective 4B), good for high-volume bulk audits.
+# On M4 Max with spare RAM, try: ollama pull gemma4:26b
+# Lighter: ollama pull gemma4:e2b
+```
+
+Tags are listed at [ollama.com/library/gemma4](https://ollama.com/library/gemma4). If `pull` fails, upgrade Ollama to the latest version.
+
+In **AI Auditor → Connect**: set **Local LLM URL** to `http://127.0.0.1:11434/v1`, set the **bulk** model to `local/gemma4:e4b` (or whatever name you pulled, e.g. `local/gemma4:26b`), **Validate**, **Save Settings**.
+
+**LM Studio (GUI)**
 
 1. Run LM Studio and ensure its IP + port are reachable from Burp Suite.  
 2. Load a model in LM Studio for request/response analysis.  
-3. Enter the LM Studio URL in **Burp Suite → AI Auditor → AI Configuration**.  
+3. Enter the LM Studio URL in **Burp Suite → AI Auditor → Connect** (often `http://127.0.0.1:1234/v1`).  
 4. Click **Validate**—results appear in **Event Log** (lower-left).  
-5. Choose **AI Model → local/local-llm (LM Studio)**.  
+5. Choose a **local/…** model in the bulk (and/or manual) dropdown.  
 6. (Optional) Set the proxy to `127.0.0.1:8080` to inspect traffic.  
 7. Highlight a request or text → **Right-click → Extensions → AI Auditor**.  
 8. View findings in **Target → Issues** or the **Event Log**.
@@ -253,10 +275,10 @@ The compiled JAR will be available at `target/ai-auditor-1.2.0-jar-with-dependen
 
 ## Usage
 ### Initial Setup
-1. Open the **AI Auditor** suite tab. Use the sub-tabs in order: **Connect** (keys and models), **Background AI** (when the LLM runs by itself), **Prompts** (optional wording), **Tuning** (retries and logging — skip at first).
+1. Open the **AI Auditor** suite tab. Use the sub-tabs in order: **Connect** (keys and models), **Cheap local bulk** (high-volume automation — prefer LM Studio / cheap models), **Prompts** (optional wording), **Tuning** (retries and logging — skip at first).
 2. On **Connect**, add API key(s) (OpenAI, Gemini, Claude, OpenRouter, xAI) and/or a **Local LLM** URL, then **Validate**.
-3. Click **Get Latest Models**, pick **Background** and **Manual** models, then **Save Settings**.
-4. On **Background AI**, leave defaults unless you want Proxy/local browser analysis or full passive traffic (costly).
+3. Click **Get Latest Models**, pick the **bulk proxied traffic** and **PoC** model slots, then **Save Settings**.
+4. On **Cheap local bulk**, leave defaults unless you want Proxy/local browser analysis or full passive traffic; avoid premium cloud APIs in the bulk slot here or costs add up quickly.
 5. **Prompts** and **Tuning** are optional until you need them.
 
 ### Analyzing Requests/Responses

@@ -129,23 +129,41 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int PASSIVE_AUDIT_DEDUP_MAX_KEYS = 8000;
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
 
-    private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP = "<html><body style='width:380px'>"
-            + "Queues the same AI audit as manual scan for Burp’s <b>Proxy</b> (browser pace). Optionally add <b>Repeater</b> via the checkbox below. "
-            + "Skips Scanner/crawler volume. Uses the <b>automatic audits</b> model + <b>Local LLM Endpoint</b> (LM Studio). "
-            + "On Apple Silicon, <b>Gemma 3+</b> GGUF chat models are a strong default."
-            + "</body></html>";
+    private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP =
+            "Intended path for cheap automation: local LM, not premium cloud APIs. "
+            + "Uses only the Connect tab bulk model (Cheap Local LLM slot), never the Premium PoC model. "
+            + "Runs only if that bulk model is a local/… provider and Local LLM URL is set — otherwise this checkbox does nothing. "
+            + "Queues the same audit as a manual scan for Proxy traffic (browser pace). Optional Repeater via the checkbox below. "
+            + "Gemma 4 (Ollama or GGUF in LM Studio) is a strong default on Apple Silicon.";
 
     private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
-            "Local LLM quick setup (browser traffic via Proxy):\n\n"
-            + "1) Install LM Studio (lmstudio.ai), open the Search tab, download a small instruction-tuned GGUF "
-            + "(Google Gemma 3 / Gemma 2 / future Gemma 4-class models work well on M-series Macs).\n"
-            + "2) Load the model, open the Local Server tab, Start Server — note the URL (often http://127.0.0.1:1234/v1).\n"
-            + "3) Paste that URL into \"Local LLM Endpoint\" on the left, set AI Model to local/local-llm or your loaded id, Save.\n"
-            + "4) Enable \"Auto-audit browser (Proxy) → local LLM\" below. Browse through Burp; only Proxy traffic is analyzed.\n"
-            + "5) Optional: point Burp’s proxy at 127.0.0.1:8080 and this extension at the LM Studio URL — "
+            "— Terminal path: Ollama + Gemma 4 (good default on Apple Silicon, e.g. M4 Max) —\n\n"
+            + "Install and start Ollama (macOS, Homebrew):\n"
+            + "  brew install ollama\n"
+            + "  ollama serve\n"
+            + "(Leave that running, or use: brew services start ollama)\n"
+            + "Use a second terminal for the pull command below.\n\n"
+            + "Pull Gemma 4 (pick one — see ollama.com/library/gemma4):\n"
+            + "  ollama pull gemma4:e4b\n"
+            + "  # Fast edge-sized model (~effective 4B) for high-volume bulk audits.\n"
+            + "  # On M4 Max with headroom, try instead:\n"
+            + "  # ollama pull gemma4:26b\n"
+            + "  # Lighter option:\n"
+            + "  # ollama pull gemma4:e2b\n"
+            + "If pull fails, update Ollama to the latest version (Gemma 4 needs a recent build).\n\n"
+            + "In AI Auditor → Connect → paste and Save:\n"
+            + "  Local LLM URL:  http://127.0.0.1:11434/v1\n"
+            + "  Bulk model:     local/gemma4:e4b   (must match the name from \"ollama list\" / your pull)\n"
+            + "Click Validate, Get Latest Models if needed, then Save Settings.\n\n"
+            + "— GUI path: LM Studio —\n\n"
+            + "1) Install LM Studio (lmstudio.ai), open Search, download a Gemma 4 instruction-tuned GGUF when available.\n"
+            + "2) Load the model → Local Server → Start Server (URL is often http://127.0.0.1:1234/v1).\n"
+            + "3) Paste that URL into Local LLM URL on Connect; set the bulk slot to local/<loaded model id>; Save.\n"
+            + "4) On this tab, enable \"Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)\" "
+            + "if you want browser Proxy traffic analyzed.\n"
+            + "5) Optional: Burp proxy at 127.0.0.1:8080 while this extension still uses the LM URL above — "
             + "requests to the LM host are skipped to avoid feedback loops.\n"
-            + "6) If you set \"Proxy (IP:Port)\" here for cloud APIs, localhost and your LM Studio host still connect directly "
-            + "(Burp’s own upstream proxy setting does not affect that path).\n";
+            + "6) If you set HTTP proxy under Tuning for cloud APIs, localhost and your local LLM host still go direct.\n";
      
      private MontoyaApi api;
      private PersistedObject persistedData;
@@ -504,7 +522,7 @@ private void createMainTab() {
 
         JTextArea quickStart = new JTextArea(
                 "Three steps: (1) Connect tab — add a key or local LM, Validate, pick models, Save. "
-                + "(2) Background tab — leave defaults unless you want browser/Proxy AI or \"all traffic\" (costly). "
+                + "(2) Cheap local bulk tab — when to run the Connect bulk model; meant for LM Studio / cheap APIs (premium cloud here gets expensive fast). Premium PoC is manual-only. "
                 + "(3) Prompts tab — optional; skip until you want custom wording.",
                 3, 68);
         quickStart.setEditable(false);
@@ -519,7 +537,7 @@ private void createMainTab() {
         JTabbedPane tabs = new JTabbedPane();
         tabs.setBorder(BorderFactory.createEmptyBorder(0, 4, 4, 4));
         tabs.addTab("Connect", wrapTabScroll(buildSetupProvidersPanel()));
-        tabs.addTab("Background AI", wrapTabScroll(buildAutomationDefaultsPanel()));
+        tabs.addTab("Cheap local bulk", wrapTabScroll(buildAutomationDefaultsPanel()));
         tabs.addTab("Prompts", wrapTabScroll(buildPromptsPanel()));
         tabs.addTab("Tuning", wrapTabScroll(buildAdvancedStatusPanel()));
 
@@ -565,7 +583,7 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel connectHint = new JLabel("<html><div style='width:520px'>Add <b>one</b> cloud key <i>or</i> a local LM Studio URL, click <b>Validate</b>, then <b>Get Latest Models</b> and <b>Save Settings</b>.</div></html>");
+        JLabel connectHint = new JLabel("Add one cloud key or a local LM Studio URL, click Validate, then Get Latest Models and Save Settings.");
         rgbc.gridy = 0;
         root.add(connectHint, rgbc);
 
@@ -604,8 +622,8 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.weightx = 0;
         JLabel localEndpointLabel = new JLabel("Local LLM URL (LM Studio):");
-        localEndpointLabel.setToolTipText("<html>LM Studio → Local Server → copy OpenAI base URL (e.g. <code>http://127.0.0.1:1234/v1</code>). "
-                + "Load a Gemma-class or similar GGUF model before starting the server.</html>");
+        localEndpointLabel.setToolTipText("LM Studio → Local Server → copy OpenAI base URL (e.g. http://127.0.0.1:1234/v1). "
+                + "Load Gemma 4 (or another chat) GGUF in LM Studio before starting the server.");
         cred.add(localEndpointLabel, gbc);
         localEndpointField = new JTextField(40);
         localEndpointField.setToolTipText(localEndpointLabel.getToolTipText());
@@ -629,9 +647,9 @@ private void createMainTab() {
         gbc.gridx = 0;
         gbc.gridy = row;
         gbc.weightx = 0;
-        JLabel autoModelLabel = new JLabel("Background / automatic:");
-        autoModelLabel.setToolTipText("<html>Used for Scanner-issue follow-ups, Proxy/Repeater capture, and passive “all traffic”. "
-                + "Often <code>local/…</code> or a small cheap cloud model.</html>");
+        JLabel autoModelLabel = new JLabel("Cheap Local LLM (Bulk Proxied Traffic):");
+        autoModelLabel.setToolTipText("Used for automatic, high-volume work: Scanner-issue follow-ups, Proxy/Repeater capture, "
+                + "and passive “all traffic”. Typical choice: local/… or a small cheap cloud model.");
         models.add(autoModelLabel, gbc);
         automaticAuditModelDropdown = new JComboBox<>();
         automaticAuditModelDropdown.setToolTipText(autoModelLabel.getToolTipText());
@@ -643,8 +661,9 @@ private void createMainTab() {
         gbc.gridx = 0;
         gbc.gridy = row;
         gbc.weightx = 0;
-        JLabel manualModelLabel = new JLabel("Manual (right-click, Explain, PoC):");
-        manualModelLabel.setToolTipText("<html>Used when <b>you</b> start an action from the context menu. Pick a stronger model if you like.</html>");
+        JLabel manualModelLabel = new JLabel("Premium Model for PoCs:");
+        manualModelLabel.setToolTipText("Used when you start an action: context menu scans, Explain me this, PoC / exploitation notes, "
+                + "and similar. Pick a stronger model when quality matters.");
         models.add(manualModelLabel, gbc);
         manualInvestigationModelDropdown = new JComboBox<>();
         manualInvestigationModelDropdown.setToolTipText(manualModelLabel.getToolTipText());
@@ -713,13 +732,13 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel bgHint = new JLabel("<html><div style='width:520px'>These only affect <b>automatic</b> LLM calls. "
-                + "Right-click scans always work. Most users: leave the first two boxes on, leave <b>all passive traffic</b> off.</div></html>");
+        JLabel bgHint = new JLabel("This tab is for high-volume automation: point the Connect bulk model (Cheap Local LLM slot) at LM Studio or another cheap endpoint. "
+                + "Premium cloud APIs there can rack up large bills. Manual Premium PoC is for right-click / Explain / PoC only — not these checkboxes.");
         rgbc.gridy = 0;
         root.add(bgHint, rgbc);
 
         JPanel autoBox = new JPanel(new GridBagLayout());
-        autoBox.setBorder(BorderFactory.createTitledBorder("When to run the AI without you clicking"));
+        autoBox.setBorder(BorderFactory.createTitledBorder("When to run the cheap / local bulk model without you clicking"));
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.insets = new Insets(4, 4, 4, 4);
         gbc.fill = GridBagConstraints.HORIZONTAL;
@@ -728,17 +747,19 @@ private void createMainTab() {
         gbc.gridx = 0;
         int row = 0;
 
-        passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Burp Scanner finds an issue, ask the AI to review it (recommended)");
+        passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Scanner reports an issue, queue a bulk-model review (recommended)");
         passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
-        passiveAiAllTrafficCheckbox = new JCheckBox("Also send most passive HTTP to the AI (expensive — only if you mean it)");
+        passiveAiOnScannerIssuesCheckbox.setToolTipText("Uses the Connect bulk model only. Prefer local or a small cloud model — each Scanner issue can trigger another API call.");
+        passiveAiAllTrafficCheckbox = new JCheckBox("Also audit most passive HTTP with the bulk model (costly if that model is a cloud API)");
         passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
-        proxyBrowserLocalAiCheckbox = new JCheckBox("Send browser Proxy traffic to a local model (LM Studio)");
+        passiveAiAllTrafficCheckbox.setToolTipText("Same bulk model as Scanner follow-ups. High volume — use a local/cheap bulk model or leave off.");
+        proxyBrowserLocalAiCheckbox = new JCheckBox("Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)");
         proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
         proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP);
-        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater responses (same rules as Proxy)");
+        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater responses (same bulk-model rules as Proxy)");
         proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
-        proxyIncludeRepeaterCheckbox.setToolTipText("Queues LLM audits for HTTP responses sent from Repeater, not only the browser Proxy.");
-        passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (Target scope)");
+        proxyIncludeRepeaterCheckbox.setToolTipText("Repeater responses use the bulk model; local-only gate is the same as Proxy (see Proxy checkbox tooltip).");
+        passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (applies to all automatic paths above)");
         passiveAiInScopeCheckbox.setSelected(passiveAiInScopeOnly);
 
         gbc.gridy = row++;
@@ -781,13 +802,13 @@ private void createMainTab() {
         rgbc.gridy = 1;
         root.add(autoBox, rgbc);
 
-        JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 8, 42);
+        JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 18, 52);
         proxySetupGuideArea.setEditable(false);
         proxySetupGuideArea.setLineWrap(true);
         proxySetupGuideArea.setWrapStyleWord(true);
         proxySetupGuideArea.setBackground(UIManager.getColor("Panel.background"));
-        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LM Studio — step by step"));
-        proxySetupGuideArea.setToolTipText("Step-by-step: LM Studio + Gemma-class model + Proxy-only auto-audits.");
+        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM — Ollama (terminal) or LM Studio"));
+        proxySetupGuideArea.setToolTipText("Copy-paste Ollama commands for Gemma 4 on Apple Silicon, or follow LM Studio steps.");
         rgbc.gridy = 2;
         root.add(new JScrollPane(proxySetupGuideArea), rgbc);
 
@@ -812,12 +833,12 @@ private void createMainTab() {
         gbc.gridy = ++row;
         gbc.weightx = 0;
         JLabel proxyLabel = new JLabel("HTTP proxy for cloud APIs only (host:port):");
-        proxyLabel.setToolTipText("<html>Optional. Localhost and your Local LLM host stay <b>direct</b>.</html>");
+        proxyLabel.setToolTipText("Optional. Localhost and your Local LLM host stay direct (not via this proxy).");
         limits.add(proxyLabel, gbc);
         proxyField = new JTextField(24);
-        proxyField.setToolTipText("<html>Optional HTTP proxy for <b>this extension’s</b> outbound API calls (OpenAI, Gemini, etc.). "
-                + "Traffic to <b>localhost</b>, <b>127.0.0.1</b>, and your <b>Local LLM Endpoint</b> host is sent <b>direct</b> "
-                + "so LM Studio still works when Burp uses a separate upstream proxy for browsing.</html>");
+        proxyField.setToolTipText("Optional HTTP proxy for this extension’s outbound API calls (OpenAI, Gemini, etc.). "
+                + "Traffic to localhost, 127.0.0.1, and your Local LLM Endpoint host is sent direct "
+                + "so LM Studio still works when Burp uses a separate upstream proxy for browsing.");
         gbc.gridx = 1;
         gbc.weightx = 1.0;
         limits.add(proxyField, gbc);
@@ -826,7 +847,7 @@ private void createMainTab() {
         gbc.gridy = ++row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        limits.add(new JLabel("<html>If a model dropdown says <b>Default</b>, the extension uses these IDs per provider:</html>"), gbc);
+        limits.add(new JLabel("If a model dropdown says Default, the extension uses these IDs per provider:"), gbc);
         gbc.gridwidth = 1;
 
         defaultOpenaiModelField = new JTextField("gpt-4o-mini", 24);
@@ -835,8 +856,8 @@ private void createMainTab() {
         defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
         defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
         defaultLocalModelField = new JTextField("local-llm (LM Studio)", 24);
-        defaultLocalModelField.setToolTipText("<html>Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
-                + "Gemma 3 / newer Gemma variants are a good default on Apple Silicon.</html>");
+        defaultLocalModelField.setToolTipText("Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
+                + "Gemma 4 (or other Gemma) GGUF ids from LM Studio work well on Apple Silicon.");
 
         gbc.gridx = 0;
         gbc.gridy = ++row;
@@ -900,16 +921,17 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        panel.add(new JLabel("<html><div style='width:520px'><b>Optional.</b> Defaults work for most people. "
-                + "Change text here if you want a different tone or output shape. Snippet buttons paste common blocks into the main prompt.</div></html>"), gbc);
+        panel.add(new JLabel("The main prompt is pre-filled with the default scan instructions (same text the extension used when this box was empty). "
+                + "Edit freely. Template buttons copy individual sections to the clipboard if you want to merge or replace parts."), gbc);
 
         gbc.gridy = ++row;
-        panel.add(new JLabel("<html><b>Main prompt</b> (most scans use this)</html>"), gbc);
+        panel.add(new JLabel("Main prompt (most scans use this)"), gbc);
 
         gbc.gridy = ++row;
         promptTemplateArea = new JTextArea(10, 50);
         promptTemplateArea.setLineWrap(true);
         promptTemplateArea.setWrapStyleWord(true);
+        promptTemplateArea.setText(getDefaultPromptTemplate());
         panel.add(new JScrollPane(promptTemplateArea), gbc);
 
         gbc.gridy = ++row;
@@ -927,7 +949,7 @@ private void createMainTab() {
         panel.add(templateButtonsPanel, gbc);
 
         gbc.gridy = ++row;
-        panel.add(new JLabel("<html><b>Explain Me This</b> (right-click menu)</html>"), gbc);
+        panel.add(new JLabel("Explain Me This (right-click menu)"), gbc);
         explainMeThisPromptArea = new JTextArea(5, 50);
         explainMeThisPromptArea.setLineWrap(true);
         explainMeThisPromptArea.setWrapStyleWord(true);
@@ -936,7 +958,7 @@ private void createMainTab() {
         panel.add(new JScrollPane(explainMeThisPromptArea), gbc);
 
         gbc.gridy = ++row;
-        panel.add(new JLabel("<html><b>Investigate / PoC</b> (proof-of-concept style)</html>"), gbc);
+        panel.add(new JLabel("Investigate / PoC (proof-of-concept style)"), gbc);
         pocPromptArea = new JTextArea(6, 50);
         pocPromptArea.setLineWrap(true);
         pocPromptArea.setWrapStyleWord(true);
@@ -960,8 +982,8 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        panel.add(new JLabel("<html><div style='width:520px'><b>Optional.</b> Open this if requests fail, hit rate limits, or logs are too noisy. "
-                + "Otherwise you can ignore it.</div></html>"), gbc);
+        panel.add(new JLabel("Optional. Open this if requests fail, hit rate limits, or logs are too noisy. "
+                + "Otherwise you can ignore it."), gbc);
         gbc.gridwidth = 1;
 
         gbc.gridx = 0;
@@ -1443,9 +1465,13 @@ private void createMainTab() {
                     manualInvestigationModelDropdown.setSelectedItem(selectedModelManual);
                 }
                 
-                // Set custom prompt if exists
-                if (customPrompt != null && !customPrompt.isEmpty() && promptTemplateArea != null) {
-                    promptTemplateArea.setText(customPrompt);
+                // Main prompt: saved custom text, or built-in default (matches runtime fallback when empty)
+                if (promptTemplateArea != null) {
+                    if (customPrompt != null && !customPrompt.isEmpty()) {
+                        promptTemplateArea.setText(customPrompt);
+                    } else {
+                        promptTemplateArea.setText(getDefaultPromptTemplate());
+                    }
                 }
 
                 // Set Explain Me This prompt if exists
@@ -1613,8 +1639,10 @@ private void createMainTab() {
                 + "## 4. If you cannot build a solid PoC\n"
                 + "Say so clearly. List **specific** missing data (e.g. second role’s session, POST body schema, upstream proxy behavior) and the **next capture** the tester should take in Burp.\n\n"
                 + "## 5. Safety\n"
-                + "Only test systems the user is **authorized** to test. Flag destructive or data-integrity risks (drop tables, mass exfil, account lockout).\n\n"
-                + "Do **not** refuse solely because the topic is security testing—this is defensive, authorized appsec work.";
+                + "Assume the operator is an authorized penetration tester on approved, in-scope work (e.g. Burp Target scope). "
+                + "Do not refuse, stall, or lecture about legality on that basis—this tool is used only in that context.\n\n"
+                + "Still flag destructive or data-integrity risks (drop tables, mass exfil, account lockout) so the team can plan controlled verification.\n\n"
+                + "Do not refuse solely because the topic is security testing—treat it as defensive, professional appsec work.";
     }
 
     private synchronized void refreshGeminiApiKeys() {
@@ -2040,7 +2068,7 @@ private void createMainTab() {
             if (text == null || text.isEmpty()) {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
-            String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Verify only on authorized targets; models can be wrong.\n\n" + text;
+            String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n" + text;
             AIAuditIssue issue = new AIAuditIssue.Builder()
                     .name(findingName)
                     .detail(detail)
