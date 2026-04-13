@@ -1,12 +1,18 @@
-# AI Auditor: LLM-Powered Burp Scans with OpenAI, Google, Anthropic, OpenRouter, and Local LLMs
+# AI Auditor: LLM-powered security analysis for Burp Suite
+
 **Author**: Richard Hyunho Im ([@richeeta](https://github.com/richeeta)) at [Route Zero Security](https://routezero.security)
 
 **Contributor**: Vinaya Kumar ([@V9Y1nf0S3C](https://github.com/V9Y1nf0S3C))
 
-
-
 ## Description
-AI Auditor is an extension for Burp Suite Professional Edition and Burp Suite Enterprise Edition that integrates advanced large language models from OpenAI, Google, Anthropic, and Meta to add state-of-the-art AI capabilities to Burp Suite to enhance vulnerability scanning and analysis.
+
+AI Auditor is a **Burp Suite Professional / Enterprise** extension that sends HTTP traffic and Burp Scanner context to **large language models** and turns the model output into **Scanner-style findings** (severity, confidence, narrative, remediation hints).
+
+**Providers:** OpenAI, Google Gemini, Anthropic Claude, OpenRouter, **xAI (Grok)**, and **local** OpenAI-compatible servers (e.g. **LM Studio**). You can pick different models for **automatic** work (passive scans, Scanner-issue follow-ups, optional Proxy/Repeater capture) versus **manual** work (right-click scans, PoC generation, “Explain me this”, issue deep-dives).
+
+**How it fits into Burp:** passive scan integration, optional audits when Burp reports Scanner issues, optional high-level review of in-scope traffic, and optional **Proxy** (and **Repeater**) response capture when using a **local** model—so day-to-day browsing can be analyzed without routing full Scanner/crawler volume through the LLM. Settings, API keys, and prompts persist across restarts.
+
+**Install:** use the pre-built JAR under [`releases/`](https://github.com/patrick-projects/AIAuditor/raw/main/releases/ai-auditor-jar-with-dependencies.jar) or a [GitHub Release](https://github.com/patrick-projects/AIAuditor/releases/latest); load it under **Extensions → Add → Java**.
 
 ### Issues Reported by AI Auditor
 ![ScannerReport](images/ScannerReport.png)
@@ -133,9 +139,11 @@ Separate text boxes fir differnt prompts are are available for scanning and for 
 
 ## Features
 ### Core Capabilities
-*   **Multi-Provider AI Integration**: **OpenAI** (`gpt-4o`, `gpt-4o-mini`, `o1-preview`, `o1-mini`), **Google Gemini** (`gemini-1.5-pro`, `gemini-1.5-flash`), **Anthropic Claude** (`claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, `claude-3-opus-latest`), and **OpenRouter**.
-*   **Local LLM Support**: Connect to a local LM Studio server for enhanced privacy and offline analysis.
-*   **Dynamic Model Loading**: Automatically fetch and display the latest models from providers. Use any model compatible with the API.
+*   **Multi-provider models**: **OpenAI**, **Google Gemini**, **Anthropic Claude**, **OpenRouter**, and **xAI (Grok)**—plus **local** OpenAI-compatible endpoints (LM Studio and similar). Defaults and “Get Latest Models” keep the dropdowns current when API keys or the local server are configured.
+*   **Two model slots**: **AI Model (automatic audits)** vs **AI Model (manual / PoC / Explain)** so you can use a small local or cheap model for background work and a stronger model for interactive analysis.
+*   **Local LLM Support**: Connect to a local LM Studio (or compatible) server for privacy; optional **Proxy** (and **Repeater**) auto-audit uses the automatic-audit model when a **local** provider is selected.
+*   **Passive & Scanner-triggered audits**: Optional AI review on **Burp Scanner issues**, optional **passive “all traffic”** mode (in-scope aware), with deduplication and batching where appropriate.
+*   **Dynamic Model Loading**: Fetch and filter provider model lists; hide unwanted entries with **Hide these Models**.
 *   **"Explain Me This" Feature**: Right-click selected text to get a detailed security explanation from the AI, which is then added as an informational finding in Burp's issue tracker.
 *   **Detailed Vulnerability Reporting**: Vulnerability description, location, exploitation methods, severity levels (`HIGH`, `MEDIUM`, `LOW`, `INFORMATIVE`) and confidence levels (`CERTAIN`, `FIRM`, `TENTATIVE`).
 *   **Custom Instructions**: Tailor the AI’s focus and analysis for special use cases.
@@ -164,11 +172,12 @@ Separate text boxes fir differnt prompts are are available for scanning and for 
 ## Prerequisites
 ### For General Usage
 * **Operating System**: Windows, macOS, or Linux.
-* **API Key**: A valid API key for at least one of the following:
+* **API Key** (or local endpoint): Configure at least one of:
   * [Anthropic](https://docs.anthropic.com/en/api/getting-started)
-  * [Google Gemini](https://ai.google.dev/gemini/get_the_api_key) — recommended for newbies since Google offers a relatively generous free tier to use its Gemini API.
+  * [Google Gemini](https://ai.google.dev/gemini/get_the_api_key) — generous free tier for trying the extension.
   * [OpenAI](https://platform.openai.com/docs/quickstart)
   * [OpenRouter](https://openrouter.ai/keys)
+  * [xAI](https://docs.x.ai/) (Grok), or a **local** OpenAI-compatible URL (e.g. LM Studio) plus optional local API key.
 * **Burp Suite Professional Edition** or **Burp Suite Enterprise Edition**
   * **NOTE**: Burp Suite Community Edition is currently not supported.
 

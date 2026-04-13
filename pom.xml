@@ -7,6 +7,9 @@
     <groupId>com.security</groupId>
     <artifactId>ai-auditor</artifactId>
     <version>1.2.0</version>
+    <name>AI Auditor</name>
+    <description>Burp Suite extension: LLM-assisted vulnerability analysis via OpenAI, Gemini, Claude, OpenRouter, xAI, and local OpenAI-compatible servers (e.g. LM Studio). Passive Scanner integration, optional Proxy/Repeater capture with local models, manual scans, PoC and “Explain me this”.</description>
+    <url>https://github.com/patrick-projects/AIAuditor</url>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
