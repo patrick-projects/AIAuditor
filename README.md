@@ -180,11 +180,14 @@ Separate text boxes fir differnt prompts are are available for scanning and for 
 
 ### Pre-built JAR (easiest)
 
-1. Open **[Releases](https://github.com/patrick-projects/AIAuditor/releases/latest)** for this repository.
-2. Download **`ai-auditor-1.2.0-jar-with-dependencies.jar`** (or the `*-jar-with-dependencies.jar` attached to the latest release).
-3. In Burp: **Extensions** → **Add** → **Java** → select that JAR → **Next**.
+**Download from the repo (always matches `main`):**  
+[ **`releases/ai-auditor-jar-with-dependencies.jar`**](https://github.com/patrick-projects/AIAuditor/raw/main/releases/ai-auditor-jar-with-dependencies.jar) — use “Save link as…” if your browser opens it instead of downloading.
 
-Maintainers: publishing a release is done by pushing a version tag after `main` builds clean, for example `git tag v1.2.0 && git push origin v1.2.0`. GitHub Actions attaches the fat JAR to the new release automatically.
+**Or** open **[Releases](https://github.com/patrick-projects/AIAuditor/releases/latest)** and grab the versioned `*-jar-with-dependencies.jar` attached there.
+
+**Load in Burp:** **Extensions** → **Add** → **Java** → choose the downloaded JAR → **Next**.
+
+Maintainers: after changing code, run `scripts/build-release-jar.sh`, commit the updated JAR under `releases/`, and push. To publish a tagged release with the same artifact, push a tag (for example `git tag v1.2.1 && git push origin v1.2.1`).
 
 ### Building from Source
 #### Windows

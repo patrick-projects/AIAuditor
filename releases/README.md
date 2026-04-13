@@ -1,20 +1,17 @@
-# Pre-built extension JAR
+# Pre-built extension JAR (in this repo)
 
-**File:** `ai-auditor-jar-with-dependencies.jar` (not always present in git; build locally or grab CI output).
+**File:** [`ai-auditor-jar-with-dependencies.jar`](./ai-auditor-jar-with-dependencies.jar) — committed so anyone can install without building.
 
-**Local build and copy into this folder:**
+**Direct download (raw):**  
+`https://github.com/patrick-projects/AIAuditor/raw/main/releases/ai-auditor-jar-with-dependencies.jar`
+
+**Refresh this file after code changes:**
 
 ```bash
 ./scripts/build-release-jar.sh
+git add releases/ai-auditor-jar-with-dependencies.jar
 ```
 
-**Manual:**
-
-```bash
-mvn clean package -DskipTests
-cp target/ai-auditor-*-jar-with-dependencies.jar releases/ai-auditor-jar-with-dependencies.jar
-```
-
-**CI:** Every push to `main` runs **Build extension JAR** in the repo’s Actions tab and uploads the fat JAR as artifact **ai-auditor-burp-jar**.
+**CI:** Pushes to `main` still upload a workflow artifact **ai-auditor-burp-jar** under Actions. Tagged releases also attach the same fat JAR on the Releases page.
 
 Load in Burp: **Extensions → Add → Java →** select the JAR.
