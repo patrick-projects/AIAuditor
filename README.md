@@ -253,11 +253,11 @@ The compiled JAR will be available at `target/ai-auditor-1.2.0-jar-with-dependen
 
 ## Usage
 ### Initial Setup
-1. Open the **AI Auditor** suite tab. The UI is split into sub-tabs: **Setup & providers** (keys and models), **Automation & defaults** (when background LLM runs), **Prompts**, and **Advanced & status** (retries, logging, task queue).
-2. On **Setup & providers**, enter API key(s) for the providers you use (OpenAI, Gemini, Claude, OpenRouter, xAI) and/or your **Local LLM** endpoint.
-3. Click **Validate** for each provider you care about.
-4. On **Prompts**, adjust the main template and optional **Explain** / **PoC** prompts if you want.
-5. Click **Save Settings** (on Setup or Prompts) when you are done.
+1. Open the **AI Auditor** suite tab. Use the sub-tabs in order: **Connect** (keys and models), **Background AI** (when the LLM runs by itself), **Prompts** (optional wording), **Tuning** (retries and logging — skip at first).
+2. On **Connect**, add API key(s) (OpenAI, Gemini, Claude, OpenRouter, xAI) and/or a **Local LLM** URL, then **Validate**.
+3. Click **Get Latest Models**, pick **Background** and **Manual** models, then **Save Settings**.
+4. On **Background AI**, leave defaults unless you want Proxy/local browser analysis or full passive traffic (costly).
+5. **Prompts** and **Tuning** are optional until you need them.
 
 ### Analyzing Requests/Responses
 #### Full Scan (Single Analysis)
