@@ -58,6 +58,7 @@ import java.awt.event.ActionEvent;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -128,6 +129,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     private static final int PASSIVE_AUDIT_DEDUP_MAX_KEYS = 8000;
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
+
+    /** Validation HTTP calls use short timeouts so the UI does not hang on unreachable hosts. */
+    private static final int VALIDATION_CONNECT_MS = 15000;
+    private static final int VALIDATION_READ_MS = 25000;
 
     private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP =
             "Intended path for cheap automation: local LM, not premium cloud APIs. "
@@ -1669,12 +1674,13 @@ private void createMainTab() {
     }
     
     private boolean validateApiKeyWithEndpoint(String apiKey, String endpoint, String jsonBody, String provider) {
+        HttpURLConnection conn = null;
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection();
+            URL url = new URL(endpoint);
+            conn = openValidationConnection(url);
             conn.setRequestMethod(jsonBody.isEmpty() ? "GET" : "POST");
             conn.setRequestProperty("Content-Type", "application/json");
-    
-            // Add provider-specific headers
+
             if ("openai".equals(provider)) {
                 conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             } else if ("claude".equals(provider)) {
@@ -1685,60 +1691,82 @@ private void createMainTab() {
             } else if ("local".equals(provider) && apiKey != null && !apiKey.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             }
-    
-            // Send request body if necessary
+
             if (!jsonBody.isEmpty()) {
                 conn.setDoOutput(true);
                 try (OutputStream os = conn.getOutputStream()) {
                     os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
                 }
             }
-    
-            // Check response code
+
             int responseCode = conn.getResponseCode();
             if (responseCode == 200) {
                 return true;
-            } else {
-                // Log error response
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getErrorStream(), StandardCharsets.UTF_8))) {
-                    StringBuilder errorResponse = new StringBuilder();
+            }
+            String errorResponse = "";
+            InputStream es = conn.getErrorStream();
+            if (es != null) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(es, StandardCharsets.UTF_8))) {
+                    StringBuilder sb = new StringBuilder();
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        errorResponse.append(line);
+                        sb.append(line);
                     }
-                    api.logging().logToError("Validation failed: " + errorResponse);
+                    errorResponse = sb.toString();
                 }
-                return false;
             }
+            api.logging().logToError("Validation failed HTTP " + responseCode + ": " + errorResponse);
+            return false;
         } catch (Exception e) {
             api.logging().logToError("Error validating API key: " + e.getMessage());
             return false;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
     }
     
     
     /**
-     * Checks OpenAI-compatible {@code GET {base}/models} (LM Studio, Ollama, etc.). Optional bearer uses Local LLM API Key.
+     * Checks OpenAI-compatible {@code GET {base}/models} (LM Studio, Ollama, etc.). Runs off the Swing EDT so the UI
+     * stays responsive; uses the same proxy bypass rules as outbound LLM calls so localhost is not sent via Burp.
      */
     private void validateLocalLlmEndpoint() {
-        try {
-            String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
-            if (base.isEmpty()) {
-                api.logging().raiseErrorEvent("Enter Local LLM URL first (e.g. http://127.0.0.1:11434/v1).");
-                return;
-            }
-            String apiKey = localKeyField != null ? new String(localKeyField.getPassword()).trim() : "";
-            String normalized = base.replaceAll("/+$", "");
-            String endpoint = normalized + "/models";
-            log("Validating local LLM: GET " + endpoint, LogCategory.GENERAL);
+        if (api == null) {
+            return;
+        }
+        String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
+        if (base.isEmpty()) {
+            api.logging().raiseErrorEvent("Enter Local LLM URL first (e.g. http://127.0.0.1:11434/v1).");
+            return;
+        }
+        final String apiKey = localKeyField != null ? new String(localKeyField.getPassword()).trim() : "";
+        final String normalized = base.replaceAll("/+$", "");
+        final String endpoint = normalized + "/models";
+
+        api.logging().logToOutput("AI Auditor: Validating Local LLM — GET " + endpoint + " (see Event Log when done).");
+
+        Runnable runValidation = () -> {
+            log("Validating local LLM (background): GET " + endpoint, LogCategory.GENERAL);
             boolean ok = validateApiKeyWithEndpoint(apiKey, endpoint, "", "local");
-            if (ok) {
-                api.logging().raiseInfoEvent("Local LLM URL is valid (/models responded OK).");
-            } else {
-                api.logging().raiseErrorEvent("Local LLM URL validation failed — check the URL, that the server is running, and the optional API key.");
-            }
-        } catch (Exception e) {
-            showError("Local LLM validation error", e);
+            final boolean success = ok;
+            SwingUtilities.invokeLater(() -> {
+                if (success) {
+                    api.logging().raiseInfoEvent("Local LLM URL is valid (/models responded OK).");
+                    api.logging().logToOutput("AI Auditor: Local LLM validation succeeded.");
+                } else {
+                    api.logging().raiseErrorEvent(
+                            "Local LLM validation failed — is Ollama running (ollama serve)? URL correct? Optional API key? Check Extension output for HTTP details.");
+                    api.logging().logToOutput("AI Auditor: Local LLM validation failed (see Extension Errors / Event Log).");
+                }
+            });
+        };
+
+        if (threadPoolManager != null) {
+            threadPoolManager.getExecutor().execute(runValidation);
+        } else {
+            runValidation.run();
         }
     }
 
@@ -2622,6 +2650,35 @@ private void createMainTab() {
             }
         }
         return false;
+    }
+
+    /**
+     * Same proxy rules as {@link #sendRequest}: extension HTTP proxy applies except for localhost / local LM host.
+     */
+    private HttpURLConnection openValidationConnection(URL url) throws IOException {
+        HttpURLConnection conn;
+        String proxyString = proxyField != null ? proxyField.getText().trim() : "";
+        if (!proxyString.isEmpty() && !shouldBypassExtensionProxyForUrl(url)) {
+            try {
+                String[] proxyParts = proxyString.split(":");
+                if (proxyParts.length != 2) {
+                    conn = (HttpURLConnection) url.openConnection();
+                } else {
+                    String pHost = proxyParts[0].trim();
+                    int pPort = Integer.parseInt(proxyParts[1].trim());
+                    Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(pHost, pPort));
+                    conn = (HttpURLConnection) url.openConnection(proxy);
+                }
+            } catch (Exception e) {
+                api.logging().logToError("Validation: invalid extension proxy, using direct connection: " + e.getMessage());
+                conn = (HttpURLConnection) url.openConnection();
+            }
+        } else {
+            conn = (HttpURLConnection) url.openConnection();
+        }
+        conn.setConnectTimeout(VALIDATION_CONNECT_MS);
+        conn.setReadTimeout(VALIDATION_READ_MS);
+        return conn;
     }
 
     private JSONObject sendRequest(URL url, JSONObject jsonBody, String apiKey, String model) throws Exception {
