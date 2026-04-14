@@ -1,6 +1,8 @@
 # AI Auditor: LLM-powered security analysis for Burp Suite
 
-**Author**: Richard Hyunho Im ([@richeeta](https://github.com/richeeta)) at [Route Zero Security](https://routezero.security)
+**Fork Author**: Patrick Crumbaugh
+
+Based on Work from: Richard Hyunho Im ([@richeeta](https://github.com/richeeta)) at [Route Zero Security](https://routezero.security)
 
 **Contributor**: Vinaya Kumar ([@V9Y1nf0S3C](https://github.com/V9Y1nf0S3C))
 
