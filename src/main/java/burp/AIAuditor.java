@@ -142,6 +142,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final long TIMING_SQLI_THRESHOLD_MS = 3000L;
     private static final int OOB_POLL_ROUNDS = 5;
     private static final long OOB_POLL_SLEEP_MS = 1200L;
+    /** Hidden guardrails for always-on active checks. */
+    private static final int ACTIVE_SCAN_MAX_REQUESTS_PER_INSERTION = 12;
+    private static final int ACTIVE_SCAN_MAX_REQUESTS_PER_HOST_WINDOW = 90;
+    private static final long ACTIVE_SCAN_HOST_WINDOW_MS = 60_000L;
 
     /** Validation HTTP calls use short timeouts so the UI does not hang on unreachable hosts. */
     private static final int VALIDATION_CONNECT_MS = 15000;
@@ -257,6 +261,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private volatile int passiveMaxResponseBytes = DEFAULT_PASSIVE_MAX_BODY_KB * 1024;
     private final Set<String> passiveAuditDedupKeys = ConcurrentHashMap.newKeySet();
     private final Set<String> proxyBrowserAiDedupKeys = ConcurrentHashMap.newKeySet();
+    private final Map<String, ActiveHostRequestBudget> activeHostRequestBudgets = new ConcurrentHashMap<>();
 
     private static final class PendingScannerIssueBatch {
         final List<AuditIssue> issues = new ArrayList<>();
@@ -3703,26 +3708,40 @@ public AuditResult activeAudit(HttpRequestResponse baseRequestResponse, AuditIns
     }
 
     List<AuditIssue> issues = new ArrayList<>();
-    issues.addAll(runTimingSqliChecks(baseRequestResponse, baseRequest, auditInsertionPoint));
-    issues.addAll(runOobChecks(baseRequestResponse, baseRequest, auditInsertionPoint));
+    AtomicInteger insertionRequestCount = new AtomicInteger(0);
+    issues.addAll(runTimingSqliChecks(baseRequestResponse, baseRequest, auditInsertionPoint, insertionRequestCount));
+    issues.addAll(runOobChecks(baseRequestResponse, baseRequest, auditInsertionPoint, insertionRequestCount));
     return AuditResult.auditResult(issues);
 }
 
-private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint) {
+private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint,
+        AtomicInteger insertionRequestCount) {
     List<AuditIssue> issues = new ArrayList<>();
     String[] timingPayloads = {
             "'; WAITFOR DELAY '0:0:5'--",
             "' OR SLEEP(5)-- ",
             "'||(SELECT pg_sleep(5))--"
     };
+    List<Long> baseline = measureTimings(baseRequest, insertionRequestCount, 2);
+    if (baseline.size() < 2) {
+        return issues;
+    }
+    long baselineMedian = medianMs(baseline);
     for (String payload : timingPayloads) {
         try {
             HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
-            long elapsed = sendForElapsedMs(requestWithPayload);
-            if (elapsed >= TIMING_SQLI_DELAY_MS) {
+            List<Long> injected = measureTimings(requestWithPayload, insertionRequestCount, 2);
+            if (injected.size() < 2) {
+                break;
+            }
+            long injectedMedian = medianMs(injected);
+            long delta = injectedMedian - baselineMedian;
+            if (injectedMedian >= TIMING_SQLI_DELAY_MS && delta >= TIMING_SQLI_THRESHOLD_MS) {
                 String detail = "Observed significant delay after SQL timing payload.\n\n"
                         + "- Payload: `" + payload + "`\n"
-                        + "- Elapsed: `" + elapsed + " ms`\n"
+                        + "- Baseline median: `" + baselineMedian + " ms`\n"
+                        + "- Injected median: `" + injectedMedian + " ms`\n"
+                        + "- Delta: `" + delta + " ms`\n"
                         + "- Threshold: `" + TIMING_SQLI_THRESHOLD_MS + " ms`\n\n"
                         + "This may indicate blind/time-based SQL injection.";
                 issues.add(new AIAuditIssue.Builder()
@@ -3730,7 +3749,7 @@ private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResp
                         .detail(detail)
                         .endpoint(baseRequest.url().toString())
                         .severity(AuditIssueSeverity.MEDIUM)
-                        .confidence(AuditIssueConfidence.FIRM)
+                        .confidence(delta >= (TIMING_SQLI_THRESHOLD_MS + 1500) ? AuditIssueConfidence.CERTAIN : AuditIssueConfidence.FIRM)
                         .requestResponses(Collections.singletonList(baseRequestResponse))
                         .modelUsed("scanner/active-check")
                         .build());
@@ -3743,24 +3762,30 @@ private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResp
     return issues;
 }
 
-private List<AuditIssue> runOobChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint) {
+private List<AuditIssue> runOobChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint,
+        AtomicInteger insertionRequestCount) {
     List<AuditIssue> issues = new ArrayList<>();
     if (collaboratorClient == null) {
         return issues;
     }
     String collabPayload = collaboratorClient.generatePayload().toString();
-    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, "OOB SSRF", "http://" + collabPayload + "/ssrf", collabPayload));
-    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, "OOB XXE",
+    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, insertionRequestCount,
+            "OOB SSRF", "http://" + collabPayload + "/ssrf", collabPayload));
+    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, insertionRequestCount, "OOB XXE",
             "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY xxe SYSTEM \"http://" + collabPayload + "/xxe\">]><r>&xxe;</r>",
             collabPayload));
     return issues;
 }
 
-private List<AuditIssue> runSingleOobCheck(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint, String checkName, String payload, String collabPayload) {
+private List<AuditIssue> runSingleOobCheck(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint,
+        AtomicInteger insertionRequestCount, String checkName, String payload, String collabPayload) {
     List<AuditIssue> issues = new ArrayList<>();
     try {
         HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
-        api.http().sendRequest(requestWithPayload);
+        HttpRequestResponse sent = sendActiveAuditRequest(requestWithPayload, insertionRequestCount);
+        if (sent == null) {
+            return issues;
+        }
         List<Interaction> interactions = pollCollaboratorInteractions(collabPayload);
         if (!interactions.isEmpty()) {
             String detail = "Out-of-band interaction confirmed via Burp Collaborator.\n\n"
@@ -3774,7 +3799,7 @@ private List<AuditIssue> runSingleOobCheck(HttpRequestResponse baseRequestRespon
                     .endpoint(baseRequest.url().toString())
                     .severity(AuditIssueSeverity.HIGH)
                     .confidence(AuditIssueConfidence.CERTAIN)
-                    .requestResponses(Collections.singletonList(baseRequestResponse))
+                    .requestResponses(Collections.singletonList(sent))
                     .modelUsed("scanner/active-check")
                     .build());
         }
@@ -3801,11 +3826,85 @@ private List<Interaction> pollCollaboratorInteractions(String payload) {
     return Collections.emptyList();
 }
 
-private long sendForElapsedMs(HttpRequest request) throws Exception {
+private long sendForElapsedMs(HttpRequest request, AtomicInteger insertionRequestCount) throws Exception {
     long start = System.nanoTime();
-    api.http().sendRequest(request);
+    HttpRequestResponse rr = sendActiveAuditRequest(request, insertionRequestCount);
+    if (rr == null) {
+        return -1L;
+    }
     long elapsedNs = System.nanoTime() - start;
     return TimeUnit.NANOSECONDS.toMillis(elapsedNs);
+}
+
+private List<Long> measureTimings(HttpRequest request, AtomicInteger insertionRequestCount, int repeats) {
+    List<Long> samples = new ArrayList<>();
+    for (int i = 0; i < repeats; i++) {
+        try {
+            long ms = sendForElapsedMs(request, insertionRequestCount);
+            if (ms < 0) {
+                break;
+            }
+            samples.add(ms);
+        } catch (Exception e) {
+            log("Timing sample failed: " + e.getMessage(), LogCategory.GENERAL);
+            break;
+        }
+    }
+    return samples;
+}
+
+private long medianMs(List<Long> values) {
+    if (values == null || values.isEmpty()) {
+        return 0L;
+    }
+    List<Long> copy = new ArrayList<>(values);
+    Collections.sort(copy);
+    int n = copy.size();
+    if (n % 2 == 1) {
+        return copy.get(n / 2);
+    }
+    return (copy.get((n / 2) - 1) + copy.get(n / 2)) / 2L;
+}
+
+private HttpRequestResponse sendActiveAuditRequest(HttpRequest request, AtomicInteger insertionRequestCount) throws Exception {
+    if (!tryConsumeActiveBudget(request, insertionRequestCount)) {
+        return null;
+    }
+    return api.http().sendRequest(request);
+}
+
+private boolean tryConsumeActiveBudget(HttpRequest request, AtomicInteger insertionRequestCount) {
+    if (request == null) {
+        return false;
+    }
+    if (insertionRequestCount.incrementAndGet() > ACTIVE_SCAN_MAX_REQUESTS_PER_INSERTION) {
+        return false;
+    }
+    HttpService svc = request.httpService();
+    String host = svc != null && svc.host() != null ? svc.host().toLowerCase(Locale.ROOT) : "<unknown>";
+    ActiveHostRequestBudget budget = activeHostRequestBudgets.computeIfAbsent(host, h -> new ActiveHostRequestBudget());
+    if (!budget.tryConsumeOne()) {
+        return false;
+    }
+    return true;
+}
+
+private static final class ActiveHostRequestBudget {
+    private long windowStartMs = System.currentTimeMillis();
+    private int used = 0;
+
+    synchronized boolean tryConsumeOne() {
+        long now = System.currentTimeMillis();
+        if (now - windowStartMs > ACTIVE_SCAN_HOST_WINDOW_MS) {
+            windowStartMs = now;
+            used = 0;
+        }
+        if (used >= ACTIVE_SCAN_MAX_REQUESTS_PER_HOST_WINDOW) {
+            return false;
+        }
+        used++;
+        return true;
+    }
 }
 
 @Override
