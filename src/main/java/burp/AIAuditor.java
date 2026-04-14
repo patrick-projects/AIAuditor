@@ -1480,7 +1480,7 @@ private void createMainTab() {
                 claudeKeyField.setText(claudeKey != null ? claudeKey : "");
                 openrouterKeyField.setText(openrouterKey != null ? openrouterKey : "");
                 xaiKeyField.setText(xaiKey != null ? xaiKey : "");
-                localEndpointField.setText(localEndpoint != null ? localEndpoint : "http://127.0.0.1:1234/v1");
+                localEndpointField.setText(localEndpoint != null ? localEndpoint : "http://127.0.0.1:11434/v1");
                 localKeyField.setText(localKey != null ? localKey : "");
                 proxyField.setText(proxy != null ? proxy : "");
                 filterModelsField.setText(filterModels != null ? filterModels : "embed,image,vision,free");
