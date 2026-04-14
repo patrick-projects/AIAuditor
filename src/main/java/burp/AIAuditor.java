@@ -69,9 +69,12 @@ import java.time.Instant;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.awt.event.ItemEvent;
 import java.util.*;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
@@ -129,6 +132,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     private static final int PASSIVE_AUDIT_DEDUP_MAX_KEYS = 8000;
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
+    /** Cap auto-executed PoC requests extracted from model output. */
+    private static final int MAX_AUTO_POC_REQUESTS = 8;
 
     /** Validation HTTP calls use short timeouts so the UI does not hang on unreachable hosts. */
     private static final int VALIDATION_CONNECT_MS = 15000;
@@ -182,6 +187,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private AtomicInteger currentGeminiKeyIndex = new AtomicInteger(0);
     private JTextField localEndpointField;
     private JPasswordField localKeyField;
+    /** Inline status shown under Local LLM URL Validate button. */
+    private JLabel localLlmValidationStatusLabel;
     /** Models for automatic paths: Scanner issues, Proxy/Repeater browser capture, passive crawl-all. */
     private JComboBox<String> automaticAuditModelDropdown;
     /** Models for manual actions: right-click scan, PoC, Explain, issue deep-dive from context menu. */
@@ -343,41 +350,37 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
 			String[] templateNames = {"1.AI Role (Context)", "2.Guidelines", "*3.Output Format", "4.Output Limits"};
 			String[] templateContents = {
-				// Template 1: 
-				"You are an expert web application security researcher specializing in identifying high-impact vulnerabilities. " +
-				"Analyze the provided HTTP request and response like a skilled bug bounty hunter, focusing on:\n\n" +
-				"HIGH PRIORITY ISSUES:\n" +
-				"1. Remote Code Execution (RCE) opportunities\n" +
-				"2. SQL, NoSQL, command injection vectors\n" +
-				"3. Authentication/Authorization bypasses\n" +
-				"4. Insecure deserialization patterns\n" +
-				"5. IDOR vulnerabilities (analyze ID patterns and access controls)\n" +
-				"6. OAuth security issues (token exposure, implicit flow risks, state validation)\n" +
-				"7. Sensitive information disclosure (tokens, credentials, internal paths)\n" +
-				"8. XSS with demonstrable impact (focus on stored/reflected with actual risk)\n" +
-				"9. CSRF in critical functions\n" +
-				"10. Insecure cryptographic implementations\n" +
-				"11. API endpoint security issues\n" +
-				"12. Token entropy/predictability issues\n" +
-				"Vulnerabilities that can directly be mapped to a CVE with public PoC and high-to-critical severity OWASP Top 10 vulnerabilities. \n\n",
-				
-				
+				// Template 1:
+				"You are an expert web application security researcher focused on actionable, evidence-backed findings. " +
+				"Analyze the provided HTTP request and response for OWASP Top 10 coverage and related high-value weaknesses.\n\n" +
+				"COVERAGE CHECKLIST:\n" +
+				"1. Injection classes: SQL/NoSQL/command/template/HTML injection, SSRF, request smuggling\n" +
+				"2. XSS classes: reflected, stored, DOM-based\n" +
+				"3. Broken access control: IDOR/object-level auth issues, function-level auth bypass, client-side-only controls\n" +
+				"4. Auth/session weaknesses: username enumeration, weak logout invalidation, unverified email change flows\n" +
+				"5. CSRF and method/verb tampering related bypasses\n" +
+				"6. Security misconfiguration/signals: verbose errors, vulnerable software version disclosure\n" +
+				"7. Session/cookie issues: missing Secure, missing/weak SameSite\n" +
+				"8. Unrestricted file upload and input validation/filtering gaps\n" +
+				"9. Missing rate limiting on login/forgot-password/registration/forms/API abuse paths\n" +
+				"10. Open redirect and phishing-assisted redirect behavior\n" +
+				"11. Exposed secrets/API keys and whether restrictions/scopes are missing\n" +
+				"12. Dependency confusion indicators (package naming/registry trust controls) when supported by evidence\n\n",
+
 				// Template 2:
 				"ANALYSIS GUIDELINES:\n" +
 				"- Prioritize issues likely to be missed by Nessus, Nuclei, and Burp Scanner\n" +
-				"- Focus on vulnerabilities requiring deep response analysis\n" +
-				"- Report API endpoints found in JS files as INFORMATION level only\n" +
-				"- Ignore low-impact findings like missing headers (CSP, cookie flags, absence of security headers)\n" +
-				"- Skip theoretical issues without clear evidence\n" +
-				"- Provide specific evidence, reproduction steps or specifically crafted proof of concept\n" +
-				"- Include detailed technical context for each finding\n\n" +
-					   
+				"- Include OWASP Top 10 mapping in explanation where applicable\n" +
+				"- Skip theoretical findings without request/response evidence or a concrete abuse path\n" +
+				"- For each finding include specific evidence and practical validation steps\n" +
+				"- If evidence is weak, downgrade confidence/severity instead of overstating impact\n\n" +
+
 				"SEVERITY CRITERIA:\n" +
-				"HIGH: Immediate security impact (examples: RCE, auth bypass, MFA bypass, OAuth implicit flow, SSRF, critical data exposure, hardcoded secrets depending on context, command injection, insecure deserialization)\n" +
-				"MEDIUM: Significant but not critical (examples: IDOR with limited scope, stored XSS, blind SSRF, blind injection, hardcoded secrets depending on context)\n" +
-				"LOW: Valid security issue but limited impact (examples: Reflected XSS, HTML or CSS or DOM manipulation requiring user interaction)\n" +
-				"INFORMATION: Useful security insights (API endpoints, potential attack surfaces)\n\n" +
-				  
+				"HIGH: Immediate exploitation impact (RCE, auth bypass, critical broken access control, command injection, insecure deserialization, account takeover)\n" +
+				"MEDIUM: Significant exploitable risk with meaningful impact (including reflected XSS when evidenced, stored XSS, IDOR with scoped impact, CSRF on sensitive actions, unrestricted upload with realistic abuse)\n" +
+				"LOW: Real but limited-impact weakness (non-sensitive verbose errors, weak hardening with constrained exploitability)\n" +
+				"INFORMATION: Useful security observations that need more evidence (possible endpoints/surfaces, weak signals only)\n\n" +
+
 				"CONFIDENCE CRITERIA:\n" +
 				"CERTAIN: Over 95 percent confident with clear evidence and reproducible\n" +
 				"FIRM: Over 60 percent confident with very strong indicators but needing additional validation\n" +
@@ -403,12 +406,11 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 				"IMPORTANT:\n" +
 				"- Only report findings with clear evidence in the request/response\n" +
 				"- Issues below 50 percent confidence should not be reported unless severity is HIGH\n" +
-				"- Include specific paths, parameters, or patterns that indicate the vulnerability\n" +
-				"- For OAuth issues, carefully analyze token handling and flows (especially implicit flow)\n" +
-				"- For IDOR, analyze ID patterns and access control mechanisms\n" +
-				"- For injection points, provide exact payload locations\n" +
-				"- Ignore hardcoded Google client ID, content security policy, strict transport security not enforced, cookie scoped to parent domain, cacheable HTTPS response, browser XSS filter disabled\n" +
-				"- For sensitive info disclosure, specify exact data exposed\n" +
+				"- Treat reflected XSS as at least MEDIUM when evidence is present (do not classify reflected XSS as LOW)\n" +
+				"- Include specific paths, parameters, headers, and behavioral differences that indicate the vulnerability\n" +
+				"- Explicitly check: username enumeration, CSRF + verb tampering, session invalidation on logout, unverified email change, open redirects, file upload controls, rate limiting, cookie Secure/SameSite, broken access control, request smuggling\n" +
+				"- Mask sensitive values in output: never print full PAN/credit card, SSN/SIN, auth tokens, session IDs, API keys, or secrets (redact to partial form)\n" +
+				"- For sensitive info disclosure, identify where evidence appears while keeping values redacted\n" +
 				"- Only return JSON with findings, no other content!"
 
 
@@ -636,6 +638,16 @@ private void createMainTab() {
         gbc.gridx = 2;
         gbc.weightx = 0;
         cred.add(validateLocalUrlButton, gbc);
+        row++;
+
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 3;
+        gbc.weightx = 1.0;
+        localLlmValidationStatusLabel = new JLabel(" ");
+        localLlmValidationStatusLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        cred.add(localLlmValidationStatusLabel, gbc);
+        gbc.gridwidth = 1;
         row++;
 
         gbc.gridx = 0;
@@ -1574,35 +1586,34 @@ private void createMainTab() {
     
     private String getDefaultPromptTemplate() {
         return "You are an expert web application security researcher specializing in identifying high-impact vulnerabilities. " +
-        "Analyze the provided HTTP request and response like a skilled bug bounty hunter, focusing on:\n\n" +
-        "HIGH PRIORITY ISSUES:\n" +
-        "1. Remote Code Execution (RCE) opportunities\n" +
-        "2. SQL, NoSQL, command injection vectors\n" +
-        "3. Authentication/Authorization bypasses\n" +
-        "4. Insecure deserialization patterns\n" +
-        "5. IDOR vulnerabilities (analyze ID patterns and access controls)\n" +
-        "6. OAuth security issues (token exposure, implicit flow risks, state validation)\n" +
-        "7. Sensitive information disclosure (tokens, credentials, internal paths)\n" +
-        "8. XSS with demonstrable impact (focus on stored/reflected with actual risk)\n" +
-        "9. CSRF in critical functions\n" +
-        "10. Insecure cryptographic implementations\n" +
-        "11. API endpoint security issues\n" +
-        "12. Token entropy/predictability issues\n" +
-        "+ Vulnerabilities that can directly be mapped to a CVE with public PoC and high-to-critical severity OWASP Top 10 vulnerabilities. \n\n" +
+        "Analyze the provided HTTP request and response like a skilled bug bounty hunter and maximize OWASP Top 10 coverage with evidence-backed findings.\n\n" +
+        "COVERAGE CHECKLIST:\n" +
+        "1. Injection classes: SQL, NoSQL, command, template, HTML injection, SSRF, request smuggling\n" +
+        "2. XSS classes: reflected, stored, DOM-based\n" +
+        "3. Broken access control: IDOR/object-level auth gaps, function-level auth bypasses, client-side-only controls for sensitive actions\n" +
+        "4. Auth/session weaknesses: username enumeration (login/forgot-password/registration), session not invalidated on logout, unverified email change paths\n" +
+        "5. CSRF weaknesses, including HTTP verb tampering that may bypass anti-CSRF assumptions\n" +
+        "6. Session cookie weaknesses: missing Secure, missing/weak SameSite\n" +
+        "7. Unrestricted file upload and weak input filtering/validation\n" +
+        "8. Missing rate limiting on form submissions and auth/account-recovery flows\n" +
+        "9. Open redirect behavior and phishing-assisted redirect chains\n" +
+        "10. Verbose error messages and vulnerable software version disclosure\n" +
+        "11. Exposed API keys/secrets and whether key restrictions/scopes are missing\n" +
+        "12. Dependency confusion indicators (NPM/package namespace/registry trust) when supported by response/build evidence\n\n" +
         "ANALYSIS GUIDELINES:\n" +
         "- Prioritize issues likely to be missed by Nessus, Nuclei, and Burp Scanner\n" +
-        "- Focus on vulnerabilities requiring deep response analysis\n" +
-        "- Report API endpoints found in JS files as INFORMATION level only\n" +
-        "- Ignore low-impact findings like missing headers (CSP, cookie flags, absence of security headers)\n" +
+        "- Focus on vulnerabilities requiring deep response and flow analysis\n" +
+        "- Report API endpoints found in JS files as INFORMATION level only unless clear exploitation evidence is present\n" +
         "- Skip theoretical issues without clear evidence\n" +
         "- Provide specific evidence, reproduction steps or specifically crafted proof of concept\n" +
-        "- Include detailed technical context for each finding\n\n" +
+        "- Include detailed technical context for each finding\n" +
+        "- If evidence is weak, downgrade confidence/severity rather than overstate impact\n\n" +
                
         "SEVERITY CRITERIA:\n" +
-        "HIGH: Immediate security impact (examples: RCE, auth bypass, MFA bypass, OAuth implicit flow, SSRF, critical data exposure, hardcoded secrets depending on context, command injection, insecure deserialization)\n" +
-        "MEDIUM: Significant but not critical (examples: IDOR with limited scope, stored XSS, blind SSRF, blind injection, hardcoded secrets depending on context)\n" +
-        "LOW: Valid security issue but limited impact (examples: Reflected XSS, HTML or CSS or DOM manipulation requiring user interaction)\n" +
-        "INFORMATION: Useful security insights (API endpoints, potential attack surfaces)\n\n" +
+        "HIGH: Immediate exploitation impact (RCE, auth bypass/account takeover, command injection, insecure deserialization, critical broken access control)\n" +
+        "MEDIUM: Significant exploitable risk with meaningful impact (including reflected XSS when evidenced, stored XSS, IDOR with scoped impact, CSRF on sensitive actions, unrestricted upload with realistic abuse)\n" +
+        "LOW: Real but limited-impact weakness with constrained exploitability\n" +
+        "INFORMATION: Useful security insights and weak signals needing more evidence\n\n" +
           
         "CONFIDENCE CRITERIA:\n" +
         "CERTAIN: Over 95 percent confident with clear evidence and reproducible\n" +
@@ -1625,12 +1636,13 @@ private void createMainTab() {
             "IMPORTANT:\n" +
             "- Only report findings with clear evidence in the request/response\n" +
             "- Issues below 50 percent confidence should not be reported unless severity is HIGH\n" +
-            "- Include specific paths, parameters, or patterns that indicate the vulnerability\n" +
-            "- For OAuth issues, carefully analyze token handling and flows (especially implicit flow)\n" +
-            "- For IDOR, analyze ID patterns and access control mechanisms\n" +
-            "- For injection points, provide exact payload locations\n" +
-            "- Ignore hardcoded Google client ID, content security policy, strict transport security not enforced, cookie scoped to parent domain, cacheable HTTPS response, browser XSS filter disabled\n" +
-            "- For sensitive info disclosure, specify exact data exposed\n" +
+            "- Treat reflected XSS as at least MEDIUM when evidence is present (do not classify reflected XSS as LOW)\n" +
+            "- Include specific paths, parameters, headers, and behavioral deltas that indicate the vulnerability\n" +
+            "- For OAuth/authorization/session issues, analyze token handling, role boundaries, logout invalidation, and account-change flows\n" +
+            "- For injection points, provide exact payload locations and at least one concrete payload example in validation_steps\n" +
+            "- Do not report low-signal findings like missing headers alone unless they materially enable exploitation\n" +
+            "- Mask sensitive values in output: never include full credit card/PAN, SSN/SIN, auth tokens, session IDs, API keys, or secrets\n" +
+            "- For sensitive info disclosure, reference location and type of data while redacting values\n" +
             "- In each finding, the \"exploitation\" and \"validation_steps\" fields must include concrete payloads, parameters, or raw HTTP fragments—not generic advice.\n" +
             "- Only return JSON with findings, no other content!";
     }
@@ -1649,6 +1661,7 @@ private void createMainTab() {
                 + "## 2. Exploitation / PoC path (this is the main deliverable)\n"
                 + "- Give a **numbered sequence** of actions as if driving Burp **Repeater**.\n"
                 + "- For **each** step include **complete raw HTTP** (request line + Host + relevant headers + body) the tester can paste, not pseudocode.\n"
+                + "- Wrap each raw request in fenced code blocks as ```http ... ``` so tooling can parse and optionally execute with confirmation.\n"
                 + "- Propose **2–4 concrete variants** where useful (e.g. different encodings, alternative parameters, CL.TE vs TE.CL style angles for smuggling-adjacent cases, error-based vs blind SQLi, polyglot XSS).\n"
                 + "- If the issue class needs **multiple requests** (login → abuse session → escalate), show that chain explicitly.\n\n"
                 + "## 3. What to observe\n"
@@ -1728,6 +1741,13 @@ private void createMainTab() {
     }
     
     
+    private void setLocalLlmValidationStatus(String text, Color color) {
+        if (localLlmValidationStatusLabel != null) {
+            localLlmValidationStatusLabel.setText(text);
+            localLlmValidationStatusLabel.setForeground(color);
+        }
+    }
+
     /**
      * Checks OpenAI-compatible {@code GET {base}/models} (LM Studio, Ollama, etc.). Runs off the Swing EDT so the UI
      * stays responsive; uses the same proxy bypass rules as outbound LLM calls so localhost is not sent via Burp.
@@ -1738,6 +1758,7 @@ private void createMainTab() {
         }
         String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
         if (base.isEmpty()) {
+            setLocalLlmValidationStatus("Enter Local LLM URL first.", Color.RED);
             api.logging().raiseErrorEvent("Enter Local LLM URL first (e.g. http://127.0.0.1:11434/v1).");
             return;
         }
@@ -1745,6 +1766,7 @@ private void createMainTab() {
         final String normalized = base.replaceAll("/+$", "");
         final String endpoint = normalized + "/models";
 
+        setLocalLlmValidationStatus("Validating...", new Color(180, 140, 0));
         api.logging().logToOutput("AI Auditor: Validating Local LLM — GET " + endpoint + " (see Event Log when done).");
 
         Runnable runValidation = () -> {
@@ -1753,9 +1775,11 @@ private void createMainTab() {
             final boolean success = ok;
             SwingUtilities.invokeLater(() -> {
                 if (success) {
+                    setLocalLlmValidationStatus("Validated: /models responded OK.", new Color(0, 130, 0));
                     api.logging().raiseInfoEvent("Local LLM URL is valid (/models responded OK).");
                     api.logging().logToOutput("AI Auditor: Local LLM validation succeeded.");
                 } else {
+                    setLocalLlmValidationStatus("Validation failed. See Event Log/Output for details.", Color.RED);
                     api.logging().raiseErrorEvent(
                             "Local LLM validation failed — is Ollama running (ollama serve)? URL correct? Optional API key? Check Extension output for HTTP details.");
                     api.logging().logToOutput("AI Auditor: Local LLM validation failed (see Extension Errors / Event Log).");
@@ -2131,7 +2155,9 @@ private void createMainTab() {
             if (text == null || text.isEmpty()) {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
-            String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n" + text;
+            String autoExecutionSummary = executeGeneratedPocRequestsWithConfirmation(text);
+            String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
+                    + text + autoExecutionSummary;
             AIAuditIssue issue = new AIAuditIssue.Builder()
                     .name(findingName)
                     .detail(detail)
@@ -2148,6 +2174,94 @@ private void createMainTab() {
             showError("PoC generation failed", cause);
             return null;
         });
+    }
+
+    private String executeGeneratedPocRequestsWithConfirmation(String aiText) {
+        List<String> requests = extractHttpRequestsFromMarkdown(aiText);
+        if (requests.isEmpty()) {
+            return "\n\n---\nAuto-execution: No parseable raw HTTP requests found in the PoC output.";
+        }
+
+        int cap = Math.min(MAX_AUTO_POC_REQUESTS, requests.size());
+        int sent = 0;
+        List<String> lines = new ArrayList<>();
+        for (int i = 0; i < cap; i++) {
+            String rawRequest = requests.get(i);
+            String preview = truncateForIssueTitle(rawRequest.replace("\r", ""), 1200);
+            boolean approved = confirmPocRequestSend(i + 1, cap, preview);
+            if (!approved) {
+                lines.add(String.format("- Request %d: skipped by user.", i + 1));
+                continue;
+            }
+            try {
+                HttpRequest req = HttpRequest.httpRequest(rawRequest);
+                HttpRequestResponse rr = api.http().sendRequest(req);
+                int status = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
+                lines.add(String.format("- Request %d: sent, HTTP %s.", i + 1, status >= 0 ? Integer.toString(status) : "no response"));
+                sent++;
+            } catch (Exception e) {
+                lines.add(String.format("- Request %d: failed to send (%s).", i + 1, e.getMessage()));
+            }
+        }
+        if (requests.size() > cap) {
+            lines.add(String.format("- %d additional request(s) ignored due to cap (%d).", requests.size() - cap, MAX_AUTO_POC_REQUESTS));
+        }
+        return "\n\n---\nAuto-execution summary (confirmation required per request):\n" + String.join("\n", lines)
+                + String.format("\nSent %d/%d request(s).", sent, cap);
+    }
+
+    private boolean confirmPocRequestSend(int index, int total, String requestPreview) {
+        AtomicBoolean approved = new AtomicBoolean(false);
+        Runnable showDialog = () -> {
+            JTextArea area = new JTextArea(requestPreview, 16, 110);
+            area.setEditable(false);
+            area.setLineWrap(false);
+            area.setCaretPosition(0);
+            JScrollPane scroll = new JScrollPane(area);
+            int choice = JOptionPane.showConfirmDialog(
+                    mainPanel,
+                    scroll,
+                    String.format("Send PoC request %d/%d?", index, total),
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.QUESTION_MESSAGE);
+            approved.set(choice == JOptionPane.YES_OPTION);
+        };
+        try {
+            if (SwingUtilities.isEventDispatchThread()) {
+                showDialog.run();
+            } else {
+                SwingUtilities.invokeAndWait(showDialog);
+            }
+        } catch (Exception e) {
+            api.logging().logToError("PoC confirmation dialog failed: " + e.getMessage());
+            return false;
+        }
+        return approved.get();
+    }
+
+    private List<String> extractHttpRequestsFromMarkdown(String text) {
+        List<String> requests = new ArrayList<>();
+        if (text == null || text.isEmpty()) {
+            return requests;
+        }
+        Pattern fencePattern = Pattern.compile("```(?:http)?\\s*\\n(.*?)\\n```", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher matcher = fencePattern.matcher(text);
+        while (matcher.find()) {
+            String block = matcher.group(1).trim();
+            if (looksLikeRawHttpRequest(block)) {
+                requests.add(block);
+            }
+        }
+        return requests;
+    }
+
+    private boolean looksLikeRawHttpRequest(String block) {
+        if (block == null || block.isEmpty()) {
+            return false;
+        }
+        int lineEnd = block.indexOf('\n');
+        String firstLine = (lineEnd >= 0 ? block.substring(0, lineEnd) : block).trim();
+        return firstLine.matches("^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\\s+\\S+\\s+HTTP/\\d\\.\\d$");
     }
 
     private void handleExplainMeThis(MessageEditorHttpRequestResponse editor) {
