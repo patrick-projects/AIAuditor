@@ -131,6 +131,12 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     private static final String PREF_PREFIX = "ai_auditor.";
 
+    /**
+     * Old UI copy; not a valid {@code model} for Ollama's OpenAI-compatible API (Ollama expects tags such as
+     * {@code gemma4:26b} from {@code ollama list}).
+     */
+    private static final String LEGACY_LOCAL_MODEL_PLACEHOLDER = "local-llm (LM Studio)";
+
     /** Anthropic Messages API: room for structured JSON findings without truncating mid-response. */
     private static final int CLAUDE_MAX_OUTPUT_TOKENS = 8192;
 
@@ -241,7 +247,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private String cachedDefaultClaude = "claude/claude-3-5-haiku-latest";
     private String cachedDefaultOpenrouter = "openrouter/mistralai/mistral-7b-instruct";
     private String cachedDefaultXai = "xai/grok-4-1-fast-non-reasoning";
-    private String cachedDefaultLocal = "local/local-llm (LM Studio)";
+    private String cachedDefaultLocal = "local/gemma4:26b";
 
     private JCheckBox passiveAiOnScannerIssuesCheckbox;
     private JCheckBox passiveAiAllTrafficCheckbox;
@@ -905,9 +911,9 @@ private void createMainTab() {
         defaultClaudeModelField = new JTextField("claude-3-5-haiku-latest", 24);
         defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
         defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
-        defaultLocalModelField = new JTextField("local-llm (LM Studio)", 24);
-        defaultLocalModelField.setToolTipText("Short id LM Studio exposes for the loaded model (often matches the GGUF name). "
-                + "Gemma 4 (or other Gemma) GGUF ids from LM Studio work well on Apple Silicon.");
+        defaultLocalModelField = new JTextField("gemma4:26b", 24);
+        defaultLocalModelField.setToolTipText("Id sent as JSON \"model\" to your local server. Ollama: a tag from `ollama list` on that host. "
+                + "LM Studio: the loaded model id in Local Server. Used for all local requests (including when the dropdown shows \"local/local-llm (LM Studio)\").");
 
         gbc.gridx = 0;
         gbc.gridy = ++row;
@@ -1556,7 +1562,9 @@ private void createMainTab() {
                 if (dmClaude != null && !dmClaude.isEmpty()) defaultClaudeModelField.setText(dmClaude);
                 if (dmOr != null && !dmOr.isEmpty()) defaultOpenrouterModelField.setText(dmOr);
                 if (dmXai != null && !dmXai.isEmpty()) defaultXaiModelField.setText(dmXai);
-                if (dmLocal != null && !dmLocal.isEmpty()) defaultLocalModelField.setText(dmLocal);
+                if (dmLocal != null && !dmLocal.isEmpty()) {
+                    defaultLocalModelField.setText(migrateLoadedLocalDefaultModelPreference(dmLocal));
+                }
 
                 migratePassiveAiPreferencesIfNeeded();
                 migrateProxyBrowserLocalAiPreferenceIfNeeded();
@@ -2572,6 +2580,31 @@ private void createMainTab() {
     }
 
     /**
+     * OpenAI-compatible {@code model} string for the local slot. Prefer Connect-tab field; ignore the legacy
+     * LM Studio menu label if it is still present in the field or dropdown suffix.
+     */
+    private String resolveOpenAiCompatibleLocalModelId(String dropdownModelSuffix) throws IllegalArgumentException {
+        String legacy = LEGACY_LOCAL_MODEL_PLACEHOLDER;
+        String fromField = defaultLocalModelField != null ? defaultLocalModelField.getText().trim() : "";
+        if (!fromField.isEmpty() && !fromField.equalsIgnoreCase(legacy)) {
+            if (fromField.contains("/")) {
+                fromField = fromField.substring(fromField.indexOf('/') + 1).trim();
+            }
+            if (!fromField.isEmpty() && !fromField.equalsIgnoreCase(legacy)) {
+                return fromField;
+            }
+        }
+        String fromDropdown = dropdownModelSuffix != null ? dropdownModelSuffix.trim() : "";
+        if (!fromDropdown.isEmpty() && !fromDropdown.equalsIgnoreCase(legacy)) {
+            return fromDropdown;
+        }
+        throw new IllegalArgumentException(
+                "AI Auditor: On Connect, set \"Local default model\" to your server's OpenAI `model` id "
+                        + "(Ollama: use a name from `ollama list` on that host). The old label \"" + legacy
+                        + "\" is not a valid model id for Ollama.");
+    }
+
+    /**
      * @param mergeWithScanPromptTemplate when {@code false}, {@code content} is sent as the full user message (PoC / explain-style tasks).
      */
     private JSONObject sendToAI(String model, String apiKey, String content, boolean mergeWithScanPromptTemplate) throws Exception {
@@ -2700,7 +2733,8 @@ private void createMainTab() {
 
             case "local":
 				url = new URL(localEndpointField.getText() + "/chat/completions");
-			    jsonBody.put("model", modelNameForApi)
+                String localModelForApi = resolveOpenAiCompatibleLocalModelId(modelNameForApi);
+			    jsonBody.put("model", localModelForApi)
 			            .put("temperature", 0.7)
 
 
@@ -3354,6 +3388,29 @@ private String getNextGeminiApiKey(boolean cycle) {
         return t;
     }
 
+    /**
+     * {@code default_model_local} historically stored {@code local/local-llm (LM Studio)}; normalize to a real id and
+     * show only the model suffix in the text field (Connect tab).
+     */
+    private static String migrateLoadedLocalDefaultModelPreference(String persisted) {
+        if (persisted == null) {
+            return "";
+        }
+        String t = persisted.trim();
+        if (t.isEmpty()) {
+            return "";
+        }
+        if ("local/local-llm (LM Studio)".equalsIgnoreCase(t)
+                || LEGACY_LOCAL_MODEL_PLACEHOLDER.equalsIgnoreCase(t)) {
+            return "gemma4:26b";
+        }
+        final String localPrefix = "local/";
+        if (t.regionMatches(true, 0, localPrefix, 0, localPrefix.length())) {
+            return t.substring(localPrefix.length()).trim();
+        }
+        return t;
+    }
+
     private void refreshCachedProviderDefaults() {
         cachedDefaultOpenai = normalizeDefaultModelLine("openai",
                 defaultOpenaiModelField != null ? defaultOpenaiModelField.getText() : null, "openai/gpt-4o-mini");
@@ -3367,7 +3424,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         cachedDefaultXai = normalizeDefaultModelLine("xai",
                 defaultXaiModelField != null ? defaultXaiModelField.getText() : null, "xai/grok-4-1-fast-non-reasoning");
         cachedDefaultLocal = normalizeDefaultModelLine("local",
-                defaultLocalModelField != null ? defaultLocalModelField.getText() : null, "local/local-llm (LM Studio)");
+                defaultLocalModelField != null ? defaultLocalModelField.getText() : null, "local/gemma4:26b");
     }
 
     private static String passiveContentTypeLower(HttpResponse response) {
