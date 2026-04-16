@@ -344,6 +344,10 @@ I am providing **AI Auditor** *as-is* ***strictly*** for educational and testing
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0.
+This project is licensed under the [**GNU Affero General Public License v3.0**](https://www.gnu.org/licenses/agpl-3.0.html). The full legal text is in [`LICENSE`](LICENSE) in this repository (matching the license of the [**original AIAuditor**](https://github.com/richeeta/AIAuditor) project).
+
+Copyright in the original work belongs to its authors (see source file headers, for example `AIAuditor.java`). This fork adds further changes; see the top of this README for maintainer attribution.
+
+If you **distribute** the extension (including the pre-built JAR), the AGPL requires you to keep copyright and license notices intact and to offer recipients the **corresponding source code** under the same license. See the `LICENSE` file for the complete conditions.
 
 

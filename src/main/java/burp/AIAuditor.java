@@ -158,11 +158,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int VALIDATION_READ_MS = 25000;
 
     private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP =
-            "Intended path for cheap automation: local LM, not premium cloud APIs. "
-            + "Uses only the Connect tab automatic/bulk model slot and the Local LLM model id under Models, never the Premium PoC model. "
-            + "Runs only if that bulk model is a local/… provider and Local LLM URL is set — otherwise this checkbox does nothing. "
-            + "Queues the same audit as a manual scan for Proxy traffic (browser pace). Optional Repeater via the checkbox below. "
-            + "Gemma 4 (Ollama or GGUF in LM Studio) is a strong default on Apple Silicon.";
+            "Unlike “broad passive HTTP”, this is only responses from Burp’s Proxy tool (and Repeater if enabled) — i.e. traffic sent through your listener, not every passive-scan hit site-wide. "
+            + "Cheap automation: uses the Connect automatic/bulk model and Local LLM model id, never the Premium PoC model. "
+            + "Runs only if bulk model is local/… and Local LLM URL is set — otherwise this checkbox does nothing. "
+            + "Queues the same audit as a manual scan at browser pace.";
 
     private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
             "— Terminal path: Ollama + Gemma 4 (e.g. E4B) —\n\n"
@@ -183,8 +182,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
             + "1) Install LM Studio (lmstudio.ai), open Search, load Gemma 4 (or similar) if you prefer the GUI over Ollama.\n"
             + "2) Load the model → Local Server → Start Server (URL is often http://127.0.0.1:1234/v1).\n"
             + "3) Paste URL into Local LLM URL on Connect; Validate; set Local LLM model id to the loaded model id; Save.\n"
-            + "4) On this tab, enable \"Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)\" "
-            + "if you want browser Proxy traffic analyzed.\n"
+            + "4) On this tab, enable \"Proxied traffic only (Proxy ± Repeater): bulk model\" "
+            + "if you want bulk LLM review of browser (or Repeater) traffic through Burp — local bulk + URL required.\n"
             + "5) Optional: Burp proxy at 127.0.0.1:8080 while this extension still uses the LM URL above — "
             + "requests to the LM host are skipped to avoid feedback loops.\n"
             + "6) If you set HTTP proxy under Tuning for cloud APIs, localhost and your local LLM host still go direct.\n";
@@ -823,15 +822,16 @@ private void createMainTab() {
         passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Scanner reports an issue, queue a bulk-model review (recommended)");
         passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
         passiveAiOnScannerIssuesCheckbox.setToolTipText("Uses the Connect automatic/bulk model only. Prefer local or a small cloud model — each Scanner issue can trigger another API call.");
-        passiveAiAllTrafficCheckbox = new JCheckBox("Also audit most passive HTTP with the bulk model (costly if that model is a cloud API)");
+        passiveAiAllTrafficCheckbox = new JCheckBox("Broad passive-scan traffic: bulk model (not Proxy-only; costly if cloud)");
         passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
-        passiveAiAllTrafficCheckbox.setToolTipText("Same bulk model as Scanner follow-ups. High volume — use a local/cheap bulk model or leave off.");
-        proxyBrowserLocalAiCheckbox = new JCheckBox("Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)");
+        passiveAiAllTrafficCheckbox.setToolTipText("Burp passive Scan check: runs the automatic/bulk model on most HTTP Burp passively analyzes (sitemap / crawl scale — high volume). "
+                + "This is not limited to traffic through the Proxy tool. Prefer local or a cheap cloud bulk model.");
+        proxyBrowserLocalAiCheckbox = new JCheckBox("Proxied traffic only (Proxy ± Repeater): bulk model (local bulk + URL)");
         proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
         proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP);
-        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater responses (same bulk-model rules as Proxy)");
+        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater with proxied-only bulk audits");
         proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
-        proxyIncludeRepeaterCheckbox.setToolTipText("Repeater responses use the bulk model; local-only gate is the same as Proxy (see Proxy checkbox tooltip).");
+        proxyIncludeRepeaterCheckbox.setToolTipText("When enabled, Repeater responses use the same proxied-only bulk path and local/… + URL rules as the Proxy checkbox above.");
         passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (applies to all automatic paths above)");
         passiveAiInScopeCheckbox.setSelected(passiveAiInScopeOnly);
 
@@ -1764,10 +1764,18 @@ private void createMainTab() {
                     errorResponse = sb.toString();
                 }
             }
-            api.logging().logToError("Validation failed HTTP " + responseCode + ": " + errorResponse);
+            if ("local".equals(provider)) {
+                api.logging().logToError("Local LLM validation failed HTTP " + responseCode + ": " + errorResponse);
+            } else {
+                api.logging().logToError("Validation failed HTTP " + responseCode + ": " + errorResponse);
+            }
             return false;
         } catch (Exception e) {
-            api.logging().logToError("Error validating API key: " + e.getMessage());
+            if ("local".equals(provider)) {
+                api.logging().logToError("Error validating Local LLM URL (GET /v1/models): " + e.getMessage());
+            } else {
+                api.logging().logToError("Error validating API key: " + e.getMessage());
+            }
             return false;
         } finally {
             if (conn != null) {

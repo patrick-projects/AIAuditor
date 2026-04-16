@@ -15,3 +15,5 @@ git add releases/ai-auditor-jar-with-dependencies.jar
 **CI:** Pushes to `main` still upload a workflow artifact **ai-auditor-burp-jar** under Actions. Tagged releases also attach the same fat JAR on the Releases page.
 
 Load in Burp: **Extender → Extensions → Add →** extension type **Java** → select the JAR → **Next**.
+
+The JAR is built from this repo’s source and is subject to the **GNU Affero General Public License v3.0**; see the root [`LICENSE`](../LICENSE) file. If you pass the JAR to others, comply with the AGPL (including source-offer requirements as applicable).

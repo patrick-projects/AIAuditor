@@ -11,6 +11,15 @@
     <description>Burp Suite extension: LLM-assisted vulnerability analysis via OpenAI, Gemini, Claude, OpenRouter, xAI, and local OpenAI-compatible servers (e.g. LM Studio). Passive Scanner integration, optional Proxy/Repeater capture with local models, manual scans, PoC and “Explain me this”.</description>
     <url>https://github.com/patrick-projects/AIAuditor</url>
 
+    <licenses>
+        <license>
+            <name>GNU Affero General Public License v3.0</name>
+            <url>https://www.gnu.org/licenses/agpl-3.0.html</url>
+            <distribution>repo</distribution>
+            <comments>Same license as the upstream project at https://github.com/richeeta/AIAuditor</comments>
+        </license>
+    </licenses>
+
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
@@ -47,6 +56,15 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>${project.basedir}</directory>
+                <targetPath>META-INF</targetPath>
+                <includes>
+                    <include>LICENSE</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <!-- Maven Assembly Plugin -->
             <plugin>
