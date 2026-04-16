@@ -133,7 +133,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     /**
      * Old UI copy; not a valid {@code model} for Ollama's OpenAI-compatible API (Ollama expects tags such as
-     * {@code gemma4:26b} from {@code ollama list}).
+     * {@code gemma4:e4b} from {@code ollama list}).
      */
     private static final String LEGACY_LOCAL_MODEL_PLACEHOLDER = "local-llm (LM Studio)";
 
@@ -159,29 +159,30 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 
     private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP =
             "Intended path for cheap automation: local LM, not premium cloud APIs. "
-            + "Uses only the Connect tab bulk model (Cheap Local LLM slot), never the Premium PoC model. "
+            + "Uses only the Connect tab automatic/bulk model slot and the Local LLM model id under Models, never the Premium PoC model. "
             + "Runs only if that bulk model is a local/… provider and Local LLM URL is set — otherwise this checkbox does nothing. "
             + "Queues the same audit as a manual scan for Proxy traffic (browser pace). Optional Repeater via the checkbox below. "
             + "Gemma 4 (Ollama or GGUF in LM Studio) is a strong default on Apple Silicon.";
 
     private static final String LOCAL_LM_STUDIO_SETUP_TEXT =
-            "— Terminal path: Ollama + Gemma 4 26B (M4 Max with 64 GB RAM) —\n\n"
+            "— Terminal path: Ollama + Gemma 4 (e.g. E4B) —\n\n"
             + "Install and start Ollama (macOS, Homebrew):\n"
             + "  brew install ollama\n"
             + "  ollama serve\n"
             + "(Leave that running, or use: brew services start ollama)\n"
             + "Use a second terminal for:\n"
-            + "  ollama pull gemma4:26b\n"
+            + "  ollama pull gemma4:e4b\n"
             + "If pull fails, update Ollama to the latest version.\n\n"
-            + "In AI Auditor → Connect:\n"
+            + "In AI Auditor → Connect → Models:\n"
             + "  Local LLM URL:  http://127.0.0.1:11434/v1\n"
             + "  Click Validate (next to the URL).\n"
-            + "  Cheap Local LLM slot:  local/gemma4:26b\n"
+            + "  Automatic / bulk model:  local/local-llm (LM Studio) or local/<tag> from Get Latest Models\n"
+            + "  Local LLM model id:  gemma4:e4b  (must match `ollama list` on that host)\n"
             + "  Get Latest Models if the dropdown is empty, then Save Settings.\n\n"
             + "— GUI path: LM Studio —\n\n"
-            + "1) Install LM Studio (lmstudio.ai), open Search, load Gemma 4 26B (or similar) if you prefer the GUI over Ollama.\n"
+            + "1) Install LM Studio (lmstudio.ai), open Search, load Gemma 4 (or similar) if you prefer the GUI over Ollama.\n"
             + "2) Load the model → Local Server → Start Server (URL is often http://127.0.0.1:1234/v1).\n"
-            + "3) Paste URL into Local LLM URL on Connect; Validate (next to URL); bulk slot local/<loaded model id>; Save.\n"
+            + "3) Paste URL into Local LLM URL on Connect; Validate; set Local LLM model id to the loaded model id; Save.\n"
             + "4) On this tab, enable \"Auto-audit Proxy traffic with the bulk model (local bulk model + LM URL required)\" "
             + "if you want browser Proxy traffic analyzed.\n"
             + "5) Optional: Burp proxy at 127.0.0.1:8080 while this extension still uses the LM URL above — "
@@ -247,7 +248,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private String cachedDefaultClaude = "claude/claude-3-5-haiku-latest";
     private String cachedDefaultOpenrouter = "openrouter/mistralai/mistral-7b-instruct";
     private String cachedDefaultXai = "xai/grok-4-1-fast-non-reasoning";
-    private String cachedDefaultLocal = "local/gemma4:26b";
+    private String cachedDefaultLocal = "local/gemma4:e4b";
 
     private JCheckBox passiveAiOnScannerIssuesCheckbox;
     private JCheckBox passiveAiAllTrafficCheckbox;
@@ -550,8 +551,8 @@ private void createMainTab() {
         mainPanel = new JPanel(new BorderLayout(8, 8));
 
         JTextArea quickStart = new JTextArea(
-                "Three steps: (1) Connect tab — add a key or local LM, Validate, pick models, Save. "
-                + "(2) Cheap local bulk tab — when to run the Connect bulk model; meant for LM Studio / cheap APIs (premium cloud here gets expensive fast). Premium PoC is manual-only. "
+                "Three steps: (1) Connect tab — add a key or local LM, Validate, pick automatic/bulk and premium models, set Local LLM model id if you use local/…, Save. "
+                + "(2) Cheap local bulk tab — when to run that automatic model (toggles and limits only; model choice stays on Connect). "
                 + "(3) Prompts tab — optional; skip until you want custom wording.",
                 3, 68);
         quickStart.setEditable(false);
@@ -612,7 +613,7 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel connectHint = new JLabel("Add one cloud key or a local LLM URL, click Validate (per provider or next to Local LLM URL), then Get Latest Models and Save Settings.");
+        JLabel connectHint = new JLabel("Add one cloud key or a local LLM URL, click Validate, then under Models pick automatic/bulk and premium models and set Local LLM model id when using local/… — Get Latest Models and Save.");
         rgbc.gridy = 0;
         root.add(connectHint, rgbc);
 
@@ -703,15 +704,31 @@ private void createMainTab() {
         gbc.gridx = 0;
         gbc.gridy = row;
         gbc.weightx = 0;
-        JLabel autoModelLabel = new JLabel("Cheap Local LLM (Bulk Proxied Traffic):");
+        JLabel autoModelLabel = new JLabel("Automatic / bulk model:");
         autoModelLabel.setToolTipText("Used for automatic, high-volume work: Scanner-issue follow-ups, Proxy/Repeater capture, "
-                + "and passive “all traffic”. Typical choice: local/… or a small cheap cloud model.");
+                + "and passive “all traffic”. Choose local/… for on-prem inference or a small cheap cloud model. "
+                + "When using local/…, set “Local LLM model id” below to the server’s OpenAI JSON model name.");
         models.add(autoModelLabel, gbc);
         automaticAuditModelDropdown = new JComboBox<>();
         automaticAuditModelDropdown.setToolTipText(autoModelLabel.getToolTipText());
         gbc.gridx = 1;
         gbc.weightx = 1.0;
         models.add(automaticAuditModelDropdown, gbc);
+        row++;
+
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.weightx = 0;
+        JLabel defaultLocalLabel = new JLabel("Local LLM model id:");
+        defaultLocalModelField = new JTextField("gemma4:e4b", 24);
+        defaultLocalModelField.setToolTipText("Sent as JSON \"model\" to your Local LLM URL for every local/… request "
+                + "(automatic bulk and manual actions when you pick a local model). Ollama: a tag from `ollama list` on that host. "
+                + "LM Studio: the loaded model id in Local Server.");
+        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
+        models.add(defaultLocalLabel, gbc);
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        models.add(defaultLocalModelField, gbc);
         row++;
 
         gbc.gridx = 0;
@@ -788,8 +805,8 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel bgHint = new JLabel("This tab is for high-volume automation: point the Connect bulk model (Cheap Local LLM slot) at LM Studio or another cheap endpoint. "
-                + "Premium cloud APIs there can rack up large bills. Manual Premium PoC is for right-click / Explain / PoC only — not these checkboxes.");
+        JLabel bgHint = new JLabel("This tab is for high-volume automation: on Connect → Models, pick the automatic/bulk model and Local LLM model id (LM Studio / Ollama). "
+                + "Premium cloud APIs as bulk can rack up large bills. Manual Premium PoC is for right-click / Explain / PoC only — not these checkboxes.");
         rgbc.gridy = 0;
         root.add(bgHint, rgbc);
 
@@ -805,7 +822,7 @@ private void createMainTab() {
 
         passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Scanner reports an issue, queue a bulk-model review (recommended)");
         passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
-        passiveAiOnScannerIssuesCheckbox.setToolTipText("Uses the Connect bulk model only. Prefer local or a small cloud model — each Scanner issue can trigger another API call.");
+        passiveAiOnScannerIssuesCheckbox.setToolTipText("Uses the Connect automatic/bulk model only. Prefer local or a small cloud model — each Scanner issue can trigger another API call.");
         passiveAiAllTrafficCheckbox = new JCheckBox("Also audit most passive HTTP with the bulk model (costly if that model is a cloud API)");
         passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
         passiveAiAllTrafficCheckbox.setToolTipText("Same bulk model as Scanner follow-ups. High volume — use a local/cheap bulk model or leave off.");
@@ -864,12 +881,12 @@ private void createMainTab() {
         proxySetupGuideArea.setWrapStyleWord(true);
         proxySetupGuideArea.setBackground(UIManager.getColor("Panel.background"));
         proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM — Ollama (terminal) or LM Studio"));
-        proxySetupGuideArea.setToolTipText("Ollama: gemma4:26b for M4 Max / 64 GB RAM. Or use LM Studio steps below.");
+        proxySetupGuideArea.setToolTipText("Ollama: gemma4:e4b by default; gemma4:26b if you have the RAM. Or use LM Studio steps below.");
         rgbc.gridy = 2;
         root.add(new JScrollPane(proxySetupGuideArea), rgbc);
 
         JPanel limits = new JPanel(new GridBagLayout());
-        limits.setBorder(BorderFactory.createTitledBorder("Limits, proxy, and \"Default\" model IDs"));
+        limits.setBorder(BorderFactory.createTitledBorder("Limits, proxy, and cloud \"Default\" model IDs"));
         gbc = new GridBagConstraints();
         gbc.insets = new Insets(4, 4, 4, 4);
         gbc.fill = GridBagConstraints.HORIZONTAL;
@@ -903,7 +920,7 @@ private void createMainTab() {
         gbc.gridy = ++row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        limits.add(new JLabel("If a model dropdown says Default, the extension uses these IDs per provider:"), gbc);
+        limits.add(new JLabel("If a model dropdown says Default, the extension uses these cloud default IDs:"), gbc);
         gbc.gridwidth = 1;
 
         defaultOpenaiModelField = new JTextField("gpt-4o-mini", 24);
@@ -911,9 +928,6 @@ private void createMainTab() {
         defaultClaudeModelField = new JTextField("claude-3-5-haiku-latest", 24);
         defaultOpenrouterModelField = new JTextField("mistralai/mistral-7b-instruct", 24);
         defaultXaiModelField = new JTextField("grok-4-1-fast-non-reasoning", 24);
-        defaultLocalModelField = new JTextField("gemma4:26b", 24);
-        defaultLocalModelField.setToolTipText("Id sent as JSON \"model\" to your local server. Ollama: a tag from `ollama list` on that host. "
-                + "LM Studio: the loaded model id in Local Server. Used for all local requests (including when the dropdown shows \"local/local-llm (LM Studio)\").");
 
         gbc.gridx = 0;
         gbc.gridy = ++row;
@@ -944,13 +958,6 @@ private void createMainTab() {
         limits.add(new JLabel("xAI:"), gbc);
         gbc.gridx = 1;
         limits.add(defaultXaiModelField, gbc);
-        gbc.gridx = 0;
-        gbc.gridy = ++row;
-        JLabel defaultLocalLabel = new JLabel("Local LLM:");
-        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
-        limits.add(defaultLocalLabel, gbc);
-        gbc.gridx = 1;
-        limits.add(defaultLocalModelField, gbc);
 
         rgbc.gridy = 3;
         root.add(limits, rgbc);
@@ -2599,7 +2606,7 @@ private void createMainTab() {
             return fromDropdown;
         }
         throw new IllegalArgumentException(
-                "AI Auditor: On Connect, set \"Local default model\" to your server's OpenAI `model` id "
+                "AI Auditor: On Connect → Models, set \"Local LLM model id\" to your server's OpenAI `model` id "
                         + "(Ollama: use a name from `ollama list` on that host). The old label \"" + legacy
                         + "\" is not a valid model id for Ollama.");
     }
@@ -3402,7 +3409,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         }
         if ("local/local-llm (LM Studio)".equalsIgnoreCase(t)
                 || LEGACY_LOCAL_MODEL_PLACEHOLDER.equalsIgnoreCase(t)) {
-            return "gemma4:26b";
+            return "gemma4:e4b";
         }
         final String localPrefix = "local/";
         if (t.regionMatches(true, 0, localPrefix, 0, localPrefix.length())) {
@@ -3424,7 +3431,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         cachedDefaultXai = normalizeDefaultModelLine("xai",
                 defaultXaiModelField != null ? defaultXaiModelField.getText() : null, "xai/grok-4-1-fast-non-reasoning");
         cachedDefaultLocal = normalizeDefaultModelLine("local",
-                defaultLocalModelField != null ? defaultLocalModelField.getText() : null, "local/gemma4:26b");
+                defaultLocalModelField != null ? defaultLocalModelField.getText() : null, "local/gemma4:e4b");
     }
 
     private static String passiveContentTypeLower(HttpResponse response) {
