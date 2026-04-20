@@ -147,7 +147,6 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int MAX_AUTO_POC_REQUESTS = 8;
     /** Limit premium verification calls per parsed response to control cost/latency. */
     private static final int MAX_PREMIUM_VERIFY_PER_RESPONSE = 4;
-    private static final String FALSE_POSITIVE_PREFIX = "False Positive (AI Review): ";
     private static final long TIMING_SQLI_DELAY_MS = 4500L;
     private static final long TIMING_SQLI_THRESHOLD_MS = 3000L;
     private static final int OOB_POLL_ROUNDS = 5;
@@ -2524,11 +2523,6 @@ private void createMainTab() {
                     : String.format("Investigate %d findings — PoC / exploitation (LLM)", selectedIssues.size()));
             genPocIssues.addActionListener(e -> handleScannerIssuesGeneratePoc(issuesCopy));
             aiAuditorMenu.add(genPocIssues);
-            JMenuItem deepDive = new JMenuItem(selectedIssues.size() == 1
-                    ? "Structured JSON audit from this issue (LLM)"
-                    : String.format("Structured JSON audit from %d issues (LLM)", selectedIssues.size()));
-            deepDive.addActionListener(e -> handleScannerIssuesDeepDive(issuesCopy));
-            aiAuditorMenu.add(deepDive);
         }
         
         // Only add the AI Auditor menu if it has sub-items
@@ -2723,7 +2717,7 @@ private void createMainTab() {
             }
             boolean likelyFalsePositive = looksLikeFalsePositiveVerdict(text);
             String autoExecutionSummary = likelyFalsePositive
-                    ? "\n\n---\nAuto-execution skipped: investigation verdict suggests likely false positive."
+                    ? "\n\n---\nAuto-execution skipped: investigation text suggests a possible false positive (verify with another model or manual PoC before closing)."
                     : executeGeneratedPocRequests(text, reqRes);
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
                     + text + autoExecutionSummary;
@@ -2733,7 +2727,7 @@ private void createMainTab() {
                 AuditIssueConfidence finalConfidence = AuditIssueConfidence.TENTATIVE;
                 if (replacementSourceIssue != null) {
                     // Keep the same issue identity so consolidation can replace the previous entry.
-                    finalIssueName = clearFalsePositivePrefix(replacementSourceIssue.name());
+                    finalIssueName = replacementSourceIssue.name();
                     if (replacementSourceIssue.severity() != null) {
                         finalSeverity = replacementSourceIssue.severity();
                     }
@@ -2741,10 +2735,9 @@ private void createMainTab() {
                         finalConfidence = replacementSourceIssue.confidence();
                     }
                     if (likelyFalsePositive) {
-                        finalIssueName = markIssueAsFalsePositive(finalIssueName);
-                        finalSeverity = AuditIssueSeverity.INFORMATION;
-                        finalConfidence = AuditIssueConfidence.TENTATIVE;
-                        detail = "**Investigation verdict:** LIKELY FALSE POSITIVE\n\n" + detail;
+                        detail = "**Model note (not definitive):** One investigation suggests a possible false positive. "
+                                + "Another model or manual testing may disagree — do not downgrade the finding from prose alone.\n\n"
+                                + detail;
                     }
                 }
                 AIAuditIssue issue = new AIAuditIssue.Builder()
@@ -2780,22 +2773,9 @@ private void createMainTab() {
         }
         String t = text.toLowerCase(Locale.ROOT);
         return t.contains("likely false positive")
-                || t.contains("false positive")
-                || t.contains("weaker variant");
-    }
-
-    private String markIssueAsFalsePositive(String name) {
-        String base = clearFalsePositivePrefix(name);
-        return FALSE_POSITIVE_PREFIX + base;
-    }
-
-    private String clearFalsePositivePrefix(String name) {
-        if (name == null) {
-            return "";
-        }
-        return name.startsWith(FALSE_POSITIVE_PREFIX)
-                ? name.substring(FALSE_POSITIVE_PREFIX.length()).trim()
-                : name;
+                || t.contains("likely a false positive")
+                || t.contains("false positive verdict")
+                || t.contains("probably a false positive");
     }
 
     private String executeGeneratedPocRequests(String aiText, HttpRequestResponse sourceRequestResponse) {
