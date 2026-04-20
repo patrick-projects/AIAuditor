@@ -145,6 +145,12 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
     /** Cap auto-executed PoC requests extracted from model output. */
     private static final int MAX_AUTO_POC_REQUESTS = 8;
+    /**
+     * PoC/investigation prompts are not chunked; cap evidence to avoid single-request provider hard-limit failures.
+     * Uses a soft target tied to maxChunkSize and a hard ceiling for safety.
+     */
+    private static final int POC_PROMPT_MIN_EVIDENCE_TOKENS = 20000;
+    private static final int POC_PROMPT_HARD_CAP_TOKENS = 180000;
     /** Limit premium verification calls per parsed response to control cost/latency. */
     private static final int MAX_PREMIUM_VERIFY_PER_RESPONSE = 4;
     private static final long TIMING_SQLI_DELAY_MS = 4500L;
@@ -2615,6 +2621,98 @@ private void createMainTab() {
         return t.length() <= maxLen ? t : t.substring(0, maxLen - 1) + "…";
     }
 
+    private String trimPocEvidenceForPrompt(String evidenceBlock, String findingName) {
+        if (evidenceBlock == null || evidenceBlock.isEmpty()) {
+            return "";
+        }
+        int estimatedTokens = RequestChunker.estimateTokens(evidenceBlock);
+        int configuredCap = maxChunkSize > 0 ? maxChunkSize : POC_PROMPT_HARD_CAP_TOKENS;
+        int targetEvidenceTokens = Math.max(
+                POC_PROMPT_MIN_EVIDENCE_TOKENS,
+                Math.min(configuredCap, POC_PROMPT_HARD_CAP_TOKENS));
+
+        if (estimatedTokens <= targetEvidenceTokens) {
+            return evidenceBlock;
+        }
+
+        int maxChars = Math.max(4096, targetEvidenceTokens * 4);
+        String trimmed = trimEvidenceBySection(evidenceBlock, maxChars);
+        int trimmedTokens = RequestChunker.estimateTokens(trimmed);
+
+        log(String.format(
+                "PoC evidence trimmed for \"%s\" from ~%d tokens to ~%d tokens (cap=%d).",
+                truncateForIssueTitle(findingName, 100),
+                estimatedTokens,
+                trimmedTokens,
+                targetEvidenceTokens), LogCategory.TOKEN_INFO);
+        appendDashboardActivity(String.format(
+                "PoC evidence trimmed — %s (~%d tokens -> ~%d)",
+                truncateForIssueTitle(findingName, 90),
+                estimatedTokens,
+                trimmedTokens));
+        return trimmed;
+    }
+
+    private String trimEvidenceBySection(String evidence, int maxChars) {
+        if (evidence == null || evidence.length() <= maxChars) {
+            return evidence;
+        }
+
+        String scannerTrafficMarker = "\n\n=== HTTP traffic (request then response) ===\n\n";
+        int scannerIdx = evidence.indexOf(scannerTrafficMarker);
+        if (scannerIdx >= 0) {
+            String prefix = evidence.substring(0, scannerIdx + scannerTrafficMarker.length());
+            int budget = Math.max(512, maxChars - prefix.length());
+            return prefix + trimTrafficRequestFirst(evidence.substring(scannerIdx + scannerTrafficMarker.length()), budget);
+        }
+
+        String responseMarker = "\n\n=== HTTP response ===\n";
+        int responseIdx = evidence.indexOf(responseMarker);
+        if (responseIdx >= 0) {
+            String prefix = evidence.substring(0, responseIdx + responseMarker.length());
+            int budget = Math.max(512, maxChars - prefix.length());
+            return prefix + truncateMiddleWithNotice(evidence.substring(responseIdx + responseMarker.length()), budget);
+        }
+
+        return truncateMiddleWithNotice(evidence, maxChars);
+    }
+
+    private String trimTrafficRequestFirst(String traffic, int budget) {
+        if (traffic == null || traffic.length() <= budget) {
+            return traffic;
+        }
+        int responseStart = traffic.indexOf("\n\nHTTP/");
+        if (responseStart <= 0) {
+            return truncateMiddleWithNotice(traffic, budget);
+        }
+
+        String requestPart = traffic.substring(0, responseStart);
+        String responsePart = traffic.substring(responseStart);
+        if (requestPart.length() >= budget) {
+            return truncateMiddleWithNotice(requestPart, budget);
+        }
+
+        int responseBudget = Math.max(256, budget - requestPart.length());
+        return requestPart + truncateMiddleWithNotice(responsePart, responseBudget);
+    }
+
+    private String truncateMiddleWithNotice(String text, int maxChars) {
+        if (text == null || text.length() <= maxChars) {
+            return text;
+        }
+        if (maxChars <= 128) {
+            return text.substring(0, maxChars);
+        }
+        String notice = "\n\n... [truncated by AI Auditor to fit model prompt limits] ...\n\n";
+        if (notice.length() >= maxChars) {
+            return text.substring(0, maxChars);
+        }
+        int bodyBudget = maxChars - notice.length();
+        int headLen = (bodyBudget * 2) / 3;
+        int tailLen = bodyBudget - headLen;
+        return text.substring(0, headLen) + notice + text.substring(text.length() - tailLen);
+    }
+
     private void handleScannerIssuesGeneratePoc(List<AuditIssue> issues) {
         if (issues == null || issues.isEmpty()) {
             return;
@@ -2687,7 +2785,8 @@ private void createMainTab() {
         if (instructions == null || instructions.trim().isEmpty()) {
             instructions = getDefaultPocPrompt();
         }
-        final String fullUserMessage = instructions + "\n\n--- Evidence ---\n\n" + evidenceBlock;
+        String boundedEvidence = trimPocEvidenceForPrompt(evidenceBlock, issueName);
+        final String fullUserMessage = instructions + "\n\n--- Evidence ---\n\n" + boundedEvidence;
         final String model = selectedModel;
         final String key = apiKey;
         final HttpRequestResponse reqRes = rr;
