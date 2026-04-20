@@ -2546,7 +2546,8 @@ private void createMainTab() {
                             + (rr.response() != null ? rr.response().toString() : "(no response captured)");
                     String evidence = issueCtx + "\n\n=== HTTP traffic (request then response) ===\n\n" + traffic;
                     String title = "AI investigate / PoC: " + truncateForIssueTitle(issue.name(), 100);
-                    runPocAsync(rr, evidence, title);
+                    // From Scanner issue context, avoid creating a second "informational" issue entry.
+                    runPocAsync(rr, evidence, title, true, issue);
                     queued++;
                 }
             }
@@ -2568,13 +2569,14 @@ private void createMainTab() {
                 + rr.request().toString()
                 + "\n\n=== HTTP response ===\n"
                 + (rr.response() != null ? rr.response().toString() : "(no response captured)");
-        runPocAsync(rr, evidence, "AI investigate / PoC notes");
+        runPocAsync(rr, evidence, "AI investigate / PoC notes", true, null);
     }
 
     /**
-     * Single LLM call with the PoC prompt only (no JSON-finding template merge). Result is added as an informational issue.
+     * Single LLM call with the PoC prompt only (no JSON-finding template merge).
+     * When {@code addAsNewIssue} is false, the result is logged for review instead of creating a new Site Map issue.
      */
-    private void runPocAsync(HttpRequestResponse rr, String evidenceBlock, String issueName) {
+    private void runPocAsync(HttpRequestResponse rr, String evidenceBlock, String issueName, boolean addAsNewIssue, AuditIssue sourceIssueForReplacement) {
         String selectedModel = getManualInvestigationModel();
         if ("Default".equals(selectedModel)) {
             api.logging().raiseErrorEvent("AI Auditor: Choose a model (not \"Default\") or configure API keys before generating a PoC.");
@@ -2602,6 +2604,8 @@ private void createMainTab() {
         final String key = apiKey;
         final HttpRequestResponse reqRes = rr;
         final String findingName = issueName;
+        final boolean shouldAddIssue = addAsNewIssue;
+        final AuditIssue replacementSourceIssue = sourceIssueForReplacement;
 
         appendDashboardActivity("PoC / investigation started — " + model + " — " + truncateForIssueTitle(findingName, 120));
 
@@ -2624,18 +2628,38 @@ private void createMainTab() {
             String autoExecutionSummary = executeGeneratedPocRequests(text);
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
                     + text + autoExecutionSummary;
-            AIAuditIssue issue = new AIAuditIssue.Builder()
-                    .name(findingName)
-                    .detail(detail)
-                    .endpoint(reqRes.request().url().toString())
-                    .severity(AuditIssueSeverity.INFORMATION)
-                    .confidence(AuditIssueConfidence.TENTATIVE)
-                    .requestResponses(Collections.singletonList(reqRes))
-                    .modelUsed(model)
-                    .build();
-            api.siteMap().add(issue);
-            log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
-            appendDashboardActivity("PoC / investigation finished — notes added to Site Map");
+            if (shouldAddIssue) {
+                String finalIssueName = findingName;
+                AuditIssueSeverity finalSeverity = AuditIssueSeverity.INFORMATION;
+                AuditIssueConfidence finalConfidence = AuditIssueConfidence.TENTATIVE;
+                if (replacementSourceIssue != null) {
+                    // Keep the same issue identity so consolidation can replace the previous entry.
+                    finalIssueName = replacementSourceIssue.name();
+                    if (replacementSourceIssue.severity() != null) {
+                        finalSeverity = replacementSourceIssue.severity();
+                    }
+                    if (replacementSourceIssue.confidence() != null) {
+                        finalConfidence = replacementSourceIssue.confidence();
+                    }
+                }
+                AIAuditIssue issue = new AIAuditIssue.Builder()
+                        .name(finalIssueName)
+                        .detail(detail)
+                        .endpoint(reqRes.request().url().toString())
+                        .severity(finalSeverity)
+                        .confidence(finalConfidence)
+                        .requestResponses(Collections.singletonList(reqRes))
+                        .modelUsed(model)
+                        .build();
+                api.siteMap().add(issue);
+                log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
+                appendDashboardActivity("PoC / investigation finished — notes added to Site Map");
+            } else {
+                log("PoC / exploitation notes generated (no issue creation): "
+                        + truncateForIssueTitle(findingName, 120), LogCategory.GENERAL);
+                api.logging().logToOutput("AI Auditor investigation result for \"" + findingName + "\":\n" + detail);
+                appendDashboardActivity("PoC / investigation finished — result generated in Extension Output");
+            }
         }).exceptionally(ex -> {
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
             appendDashboardActivity("PoC / investigation failed — " + (cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName()));
@@ -4716,6 +4740,15 @@ public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
 
 @Override
 public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue existingIssue) {
+    if (isExtensionGeneratedIssue(newIssue) && isExtensionGeneratedIssue(existingIssue)) {
+        String newName = newIssue.name() != null ? newIssue.name() : "";
+        String existingName = existingIssue.name() != null ? existingIssue.name() : "";
+        String newBase = newIssue.baseUrl() != null ? newIssue.baseUrl() : "";
+        String existingBase = existingIssue.baseUrl() != null ? existingIssue.baseUrl() : "";
+        if (newName.equals(existingName) && newBase.equals(existingBase)) {
+            return ConsolidationAction.KEEP_NEW;
+        }
+    }
     if (newIssue.name().equals(existingIssue.name()) &&
         newIssue.detail().equals(existingIssue.detail()) &&
         newIssue.severity().equals(existingIssue.severity())) {
