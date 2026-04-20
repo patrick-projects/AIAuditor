@@ -69,7 +69,6 @@ import java.time.Instant;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.awt.event.ItemEvent;
 import java.util.*;
 import java.util.List;
@@ -146,6 +145,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
     /** Cap auto-executed PoC requests extracted from model output. */
     private static final int MAX_AUTO_POC_REQUESTS = 8;
+    /** Limit premium verification calls per parsed response to control cost/latency. */
+    private static final int MAX_PREMIUM_VERIFY_PER_RESPONSE = 4;
     private static final long TIMING_SQLI_DELAY_MS = 4500L;
     private static final long TIMING_SQLI_THRESHOLD_MS = 3000L;
     private static final int OOB_POLL_ROUNDS = 5;
@@ -230,6 +231,9 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 	 private JLabel activeTasksLabel;
 	 private JLabel queuedTasksLabel;
 	 private JLabel completedTasksLabel;
+    /** Rolling log on the Dashboard tab (PoC, manual audits, passive hooks). */
+    private JTextArea dashboardActivityArea;
+    private static final int DASHBOARD_ACTIVITY_MAX_LINES = 400;
 	 private AtomicInteger completedTasksCounter = new AtomicInteger(0);
 
 
@@ -279,6 +283,30 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
         final List<AuditIssue> issues = new ArrayList<>();
         volatile HttpRequestResponse representativeRr;
         volatile ScheduledFuture<?> scheduledFlush;
+    }
+
+    private static final class PremiumVerificationContext {
+        final String model;
+        final String apiKey;
+
+        PremiumVerificationContext(String model, String apiKey) {
+            this.model = model;
+            this.apiKey = apiKey;
+        }
+    }
+
+    private static final class PremiumVerificationResult {
+        final boolean verified;
+        final AuditIssueSeverity severity;
+        final AuditIssueConfidence confidence;
+        final String reason;
+
+        PremiumVerificationResult(boolean verified, AuditIssueSeverity severity, AuditIssueConfidence confidence, String reason) {
+            this.verified = verified;
+            this.severity = severity;
+            this.confidence = confidence;
+            this.reason = reason == null ? "" : reason.trim();
+        }
     }
 
     private final ConcurrentHashMap<String, PendingScannerIssueBatch> pendingScannerIssueBatches = new ConcurrentHashMap<>();
@@ -556,10 +584,12 @@ private void createMainTab() {
         mainPanel = new JPanel(new BorderLayout(8, 8));
 
         JTextArea quickStart = new JTextArea(
-                "Three steps: (1) Connect tab — add a key or local LM, Validate, pick automatic/bulk and premium models, set Local LLM model id if you use local/…, Save. "
-                + "(2) Cheap local bulk tab — when to run that automatic model (toggles and limits only; model choice stays on Connect). "
-                + "(3) Prompts tab — optional; skip until you want custom wording.",
-                3, 68);
+                "Dashboard tab shows live task queue + activity for PoCs, manual scans, and automated audits.\n\n"
+                + "• Connect: Set up API keys and choose models (Premium for PoCs)\n"
+                + "• Cheap local bulk: Configure when to run automatic/background work\n"
+                + "• Prompts: Customize instructions (optional)\n"
+                + "• Tuning: Advanced settings, rate limits, and logging level",
+                5, 68);
         quickStart.setEditable(false);
         quickStart.setLineWrap(true);
         quickStart.setWrapStyleWord(true);
@@ -571,6 +601,7 @@ private void createMainTab() {
 
         JTabbedPane tabs = new JTabbedPane();
         tabs.setBorder(BorderFactory.createEmptyBorder(0, 4, 4, 4));
+        tabs.addTab("Dashboard", wrapTabScroll(buildDashboardPanel()));
         tabs.addTab("Connect", wrapTabScroll(buildSetupProvidersPanel()));
         tabs.addTab("Cheap local bulk", wrapTabScroll(buildAutomationDefaultsPanel()));
         tabs.addTab("Prompts", wrapTabScroll(buildPromptsPanel()));
@@ -1154,20 +1185,6 @@ private void createMainTab() {
         detailedOnelinerLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.DETAILED_ONELINER);
         limitedLoggingRadio.addActionListener(e -> currentLoggingLevel = LoggingLevel.LIMITED);
 
-        JPanel statusPanel = new JPanel(new GridLayout(4, 1));
-        statusPanel.setBorder(BorderFactory.createTitledBorder("Task queue"));
-        activeTasksLabel = new JLabel("Active Tasks: 0");
-        queuedTasksLabel = new JLabel("Queued Tasks: 0");
-        completedTasksLabel = new JLabel("Completed Tasks: 0");
-        statusPanel.add(activeTasksLabel);
-        statusPanel.add(queuedTasksLabel);
-        statusPanel.add(completedTasksLabel);
-
-        gbc.gridx = 0;
-        gbc.gridy = ++row;
-        gbc.gridwidth = 2;
-        panel.add(statusPanel, gbc);
-
         JButton testGeminiCyclingButton = new JButton("Test Gemini Key Cycling");
         testGeminiCyclingButton.addActionListener(e -> testGeminiKeyCycling());
         gbc.gridy = ++row;
@@ -1178,11 +1195,184 @@ private void createMainTab() {
         return panel;
     }
 
+    /**
+     * Task queue + activity feed. Burp Suite’s top-level Dashboard tab cannot host extension UI; this tab is the
+     * in-extension equivalent for AI Auditor work alongside other scans.
+     */
+    private JPanel buildDashboardPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(8, 8, 8, 8);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridx = 0;
+        gbc.gridy = 0;
+        gbc.weightx = 1.0;
+        gbc.gridwidth = GridBagConstraints.REMAINDER;
+
+        JLabel header = new JLabel("AI Auditor Dashboard — Live task queue and activity feed");
+        header.setFont(header.getFont().deriveFont(Font.BOLD, 14f));
+        panel.add(header, gbc);
+
+        JLabel subheader = new JLabel("Burp's built-in Dashboard cannot host extension panels. "
+                + "This is the dedicated live view for all AI Auditor activity.");
+        subheader.setFont(subheader.getFont().deriveFont(Font.PLAIN, 12f));
+        subheader.setForeground(new Color(100, 100, 100));
+        gbc.gridy = 1;
+        gbc.insets = new Insets(2, 8, 12, 8);
+        panel.add(subheader, gbc);
+
+        // Status panel - task counters
+        JPanel statusPanel = new JPanel(new GridLayout(3, 1, 0, 4));
+        statusPanel.setBorder(BorderFactory.createTitledBorder("Task Queue"));
+        activeTasksLabel = new JLabel("Active Tasks: 0");
+        queuedTasksLabel = new JLabel("Queued Tasks: 0");
+        completedTasksLabel = new JLabel("Completed Tasks: 0");
+
+        // Style the labels for better readability
+        for (JLabel label : new JLabel[]{activeTasksLabel, queuedTasksLabel, completedTasksLabel}) {
+            label.setFont(label.getFont().deriveFont(Font.BOLD, 13f));
+        }
+
+        statusPanel.add(activeTasksLabel);
+        statusPanel.add(queuedTasksLabel);
+        statusPanel.add(completedTasksLabel);
+
+        gbc.gridy = 2;
+        gbc.weighty = 0;
+        gbc.insets = new Insets(8, 8, 8, 8);
+        panel.add(statusPanel, gbc);
+
+        // Activity log
+        gbc.gridy = 3;
+        gbc.insets = new Insets(12, 8, 4, 8);
+        JLabel activityLabel = new JLabel("Recent Activity — PoC runs, manual scans, passive/Scanner-triggered audits");
+        activityLabel.setFont(activityLabel.getFont().deriveFont(Font.BOLD, 12f));
+        panel.add(activityLabel, gbc);
+
+        dashboardActivityArea = new JTextArea(18, 70);
+        dashboardActivityArea.setEditable(false);
+        dashboardActivityArea.setLineWrap(true);
+        dashboardActivityArea.setWrapStyleWord(false); // Better for log lines
+        dashboardActivityArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        dashboardActivityArea.setBackground(new Color(28, 31, 37)); // Dark log background
+        dashboardActivityArea.setForeground(new Color(220, 225, 230)); // Light text for readability
+        dashboardActivityArea.setCaretColor(new Color(220, 225, 230));
+        dashboardActivityArea.setSelectionColor(new Color(60, 76, 107));
+        dashboardActivityArea.setSelectedTextColor(Color.WHITE);
+        dashboardActivityArea.setText("Dashboard ready. Activity will appear here as you run PoCs and scans.\n");
+
+        gbc.gridy = 4;
+        gbc.fill = GridBagConstraints.BOTH;
+        gbc.weighty = 1.0;
+        gbc.insets = new Insets(4, 8, 8, 8);
+        JScrollPane activityScroll = new JScrollPane(dashboardActivityArea);
+        activityScroll.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder("Activity Log"),
+                BorderFactory.createEmptyBorder(4, 4, 4, 4)
+        ));
+        panel.add(activityScroll, gbc);
+
+        // Control buttons
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        JButton clearActivity = new JButton("Clear Log");
+        clearActivity.addActionListener(e -> {
+            dashboardActivityArea.setText("Dashboard ready. Activity will appear here as you run PoCs and scans.\n");
+        });
+        JButton copyLog = new JButton("Copy Log");
+        copyLog.addActionListener(e -> copyActivityLogToClipboard());
+
+        controls.add(clearActivity);
+        controls.add(copyLog);
+
+        gbc.gridy = 5;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weighty = 0;
+        gbc.insets = new Insets(4, 8, 8, 8);
+        panel.add(controls, gbc);
+
+        return panel;
+    }
+
+    private void appendDashboardActivity(String line) {
+        if (dashboardActivityArea == null || line == null) {
+            return;
+        }
+        String ts = LOG_TS_FMT.format(Instant.now());
+        String row = ts + "  " + line.replace("\r", "").replace("\n", " ") + "\n";
+        SwingUtilities.invokeLater(() -> {
+            if (dashboardActivityArea == null) {
+                return;
+            }
+            dashboardActivityArea.append(row);
+            trimDashboardActivityIfNeeded();
+            scrollActivityLogToBottom();
+        });
+    }
+
+    private void scrollActivityLogToBottom() {
+        if (dashboardActivityArea == null) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            if (dashboardActivityArea != null) {
+                dashboardActivityArea.setCaretPosition(dashboardActivityArea.getDocument().getLength());
+            }
+        });
+    }
+
+    private void trimDashboardActivityIfNeeded() {
+        if (dashboardActivityArea == null) {
+            return;
+        }
+        try {
+            int lines = dashboardActivityArea.getLineCount();
+            if (lines > DASHBOARD_ACTIVITY_MAX_LINES + 20) {
+                int cut = dashboardActivityArea.getLineStartOffset(lines - DASHBOARD_ACTIVITY_MAX_LINES);
+                if (cut > 0) {
+                    dashboardActivityArea.replaceRange("", 0, cut);
+                }
+            }
+        } catch (Exception ignored) {
+            // keep UI responsive if document state is inconsistent
+        }
+    }
+
+    private void copyActivityLogToClipboard() {
+        if (dashboardActivityArea == null || dashboardActivityArea.getText().trim().isEmpty()) {
+            return;
+        }
+        try {
+            StringSelection stringSelection = new StringSelection(dashboardActivityArea.getText());
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            clipboard.setContents(stringSelection, null);
+            log("Dashboard activity log copied to clipboard.", LogCategory.GENERAL);
+        } catch (Exception ex) {
+            api.logging().logToError("Could not copy activity log to clipboard: " + ex.getMessage());
+        }
+    }
+
 	private void updateStatusPanel() {
 		if (threadPoolManager != null) {
-			activeTasksLabel.setText("Active Tasks: " + threadPoolManager.getActiveCount());
-			queuedTasksLabel.setText("Queued Tasks: " + threadPoolManager.getQueueSize());
-			completedTasksLabel.setText("Completed Tasks: " + completedTasksCounter.get());
+			int active = threadPoolManager.getActiveCount();
+			int queued = threadPoolManager.getQueueSize();
+			int completed = completedTasksCounter.get();
+
+			activeTasksLabel.setText("Active Tasks: " + active);
+			queuedTasksLabel.setText("Queued Tasks: " + queued);
+			completedTasksLabel.setText("Completed Tasks: " + completed);
+
+			// Visual feedback for active work
+			if (active > 0) {
+				activeTasksLabel.setForeground(new Color(220, 50, 50)); // Red when busy
+			} else {
+				activeTasksLabel.setForeground(UIManager.getColor("Label.foreground"));
+			}
+
+			if (queued > 5) {
+				queuedTasksLabel.setForeground(new Color(200, 140, 0)); // Orange when backlogged
+			} else {
+				queuedTasksLabel.setForeground(UIManager.getColor("Label.foreground"));
+			}
 		}
 	}
 
@@ -1693,6 +1883,8 @@ private void createMainTab() {
                 - Mask sensitive values in output: never include full credit card/PAN, SSN/SIN, auth tokens, session IDs, API keys, or secrets
                 - For sensitive info disclosure, reference location and type of data while redacting values
                 - In each finding, the "exploitation" and "validation_steps" fields must include concrete payloads, parameters, or raw HTTP fragments—not generic advice.
+                - If confidence is below FIRM or evidence is weak, return an empty findings array instead of speculative claims
+                - For each finding include at least two concrete evidence anchors from traffic (exact parameter/header/path/body fragment/status behavior)
                 - Only return JSON with findings, no other content!
                 """.stripIndent();
     }
@@ -2309,6 +2501,7 @@ private void createMainTab() {
                     "AI Auditor: Selected issue(s) have no linked HTTP traffic. Open the request in Proxy/Logger and use Scan Request/Response, or pick an issue that includes stored requests.");
         } else {
             log("Deep-dive queued " + queued + " AI audit run(s) for Scanner issue(s).", LogCategory.GENERAL);
+            appendDashboardActivity("Scanner issue deep-dive queued — " + queued + " AI audit run(s)");
         }
     }
 
@@ -2363,6 +2556,7 @@ private void createMainTab() {
                     "AI Auditor: No linked HTTP traffic on the selected issue(s). Use Generate PoC from Proxy/Logger on the raw message instead.");
         } else {
             log("Generate PoC queued " + queued + " LLM run(s).", LogCategory.GENERAL);
+            appendDashboardActivity("PoC generation queued — " + queued + " LLM run(s) from Scanner issue(s)");
         }
     }
 
@@ -2409,6 +2603,8 @@ private void createMainTab() {
         final HttpRequestResponse reqRes = rr;
         final String findingName = issueName;
 
+        appendDashboardActivity("PoC / investigation started — " + model + " — " + truncateForIssueTitle(findingName, 120));
+
         CompletableFuture.supplyAsync(() -> {
             try {
                 return sendToAI(model, key, fullUserMessage, false);
@@ -2425,7 +2621,7 @@ private void createMainTab() {
             if (text == null || text.isEmpty()) {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
-            String autoExecutionSummary = executeGeneratedPocRequestsWithConfirmation(text);
+            String autoExecutionSummary = executeGeneratedPocRequests(text);
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
                     + text + autoExecutionSummary;
             AIAuditIssue issue = new AIAuditIssue.Builder()
@@ -2439,14 +2635,16 @@ private void createMainTab() {
                     .build();
             api.siteMap().add(issue);
             log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
+            appendDashboardActivity("PoC / investigation finished — notes added to Site Map");
         }).exceptionally(ex -> {
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            appendDashboardActivity("PoC / investigation failed — " + (cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName()));
             showError("PoC generation failed", cause);
             return null;
         });
     }
 
-    private String executeGeneratedPocRequestsWithConfirmation(String aiText) {
+    private String executeGeneratedPocRequests(String aiText) {
         List<String> requests = extractHttpRequestsFromMarkdown(aiText);
         if (requests.isEmpty()) {
             return "\n\n---\nAuto-execution: No parseable raw HTTP requests found in the PoC output.";
@@ -2457,12 +2655,6 @@ private void createMainTab() {
         List<String> lines = new ArrayList<>();
         for (int i = 0; i < cap; i++) {
             String rawRequest = requests.get(i);
-            String preview = truncateForIssueTitle(rawRequest.replace("\r", ""), 1200);
-            boolean approved = confirmPocRequestSend(i + 1, cap, preview);
-            if (!approved) {
-                lines.add(String.format("- Request %d: skipped by user.", i + 1));
-                continue;
-            }
             try {
                 HttpRequest req = HttpRequest.httpRequest(rawRequest);
                 HttpRequestResponse rr = api.http().sendRequest(req);
@@ -2476,37 +2668,8 @@ private void createMainTab() {
         if (requests.size() > cap) {
             lines.add(String.format("- %d additional request(s) ignored due to cap (%d).", requests.size() - cap, MAX_AUTO_POC_REQUESTS));
         }
-        return "\n\n---\nAuto-execution summary (confirmation required per request):\n" + String.join("\n", lines)
+        return "\n\n---\nAuto-execution summary:\n" + String.join("\n", lines)
                 + String.format("\nSent %d/%d request(s).", sent, cap);
-    }
-
-    private boolean confirmPocRequestSend(int index, int total, String requestPreview) {
-        AtomicBoolean approved = new AtomicBoolean(false);
-        Runnable showDialog = () -> {
-            JTextArea area = new JTextArea(requestPreview, 16, 110);
-            area.setEditable(false);
-            area.setLineWrap(false);
-            area.setCaretPosition(0);
-            JScrollPane scroll = new JScrollPane(area);
-            int choice = JOptionPane.showConfirmDialog(
-                    mainPanel,
-                    scroll,
-                    String.format("Send PoC request %d/%d?", index, total),
-                    JOptionPane.YES_NO_OPTION,
-                    JOptionPane.QUESTION_MESSAGE);
-            approved.set(choice == JOptionPane.YES_OPTION);
-        };
-        try {
-            if (SwingUtilities.isEventDispatchThread()) {
-                showDialog.run();
-            } else {
-                SwingUtilities.invokeAndWait(showDialog);
-            }
-        } catch (Exception e) {
-            api.logging().logToError("PoC confirmation dialog failed: " + e.getMessage());
-            return false;
-        }
-        return approved.get();
     }
 
     private List<String> extractHttpRequestsFromMarkdown(String text) {
@@ -2629,7 +2792,11 @@ private void createMainTab() {
         // Ensure range is within bounds
         if (start >= 0 && end <= editorContent.length()) {
             String selectedContent = editorContent.substring(start, end);
-            processAuditRequest(editor.requestResponse(), selectedContent, true);
+            HttpRequestResponse rr = editor.requestResponse();
+            if (rr != null && rr.request() != null) {
+                appendDashboardActivity("Manual AI audit queued (selected portion) — " + truncateForIssueTitle(rr.request().url().toString(), 160));
+            }
+            processAuditRequest(rr, selectedContent, true);
         } else {
             throw new IndexOutOfBoundsException("Range [" + start + ", " + end + "] out of bounds for length " + editorContent.length());
         }
@@ -2646,6 +2813,7 @@ private void createMainTab() {
         if (reqRes == null || reqRes.request() == null) {
             return;
         }
+        appendDashboardActivity("Manual AI audit queued (full request/response) — " + truncateForIssueTitle(reqRes.request().url().toString(), 160));
         processAuditRequest(reqRes, null, false);
     }
 
@@ -2653,6 +2821,7 @@ private void createMainTab() {
         if (requests == null || requests.isEmpty()) {
             return;
         }
+        appendDashboardActivity("Manual AI audit queued — " + requests.size() + " request(s) (multi-select)");
 
         // Create a thread pool with a fixed size equal to the batch size
         ExecutorService batchExecutor = Executors.newFixedThreadPool(batchSize);
@@ -2782,7 +2951,7 @@ private void createMainTab() {
                                 semaphore.release();
                             }
                         }).thenAccept(result -> {
-                            processAIFindings(result, reqRes, processedVulnerabilities, selectedModel);
+                            processAIFindings(result, reqRes, processedVulnerabilities, selectedModel, useAutomaticAuditModel);
                         }));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -3199,8 +3368,9 @@ private void createMainTab() {
     }
 }
 
-private void processAIFindings(JSONObject aiResponse, HttpRequestResponse requestResponse, Set<String> processedVulnerabilities, String model) {
+private void processAIFindings(JSONObject aiResponse, HttpRequestResponse requestResponse, Set<String> processedVulnerabilities, String model, boolean verifyWithPremiumModel) {
     try {
+        appendDashboardActivity("AI analysis started — " + model);
         log("AI Response: " + aiResponse.toString(2), LogCategory.AI_RESPONSE_FULL);
 
         // Determine the actual model used from the response JSON
@@ -3224,15 +3394,17 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
         // Log raw content
         log("Raw content: " + content, LogCategory.RAW_CONTENT);
 
-        // Unwrap ```json ... ```
-        if (content.startsWith("```json")) {
-            content = content.substring(content.indexOf("{"), content.lastIndexOf("}") + 1);
+        String findingsJsonText = extractFindingsJsonText(content);
+        if (findingsJsonText == null) {
+            appendDashboardActivity("AI analysis skipped — model returned non-JSON findings format");
+            log("AI findings skipped: response did not contain parseable JSON object with 'findings'.", LogCategory.GENERAL);
+            return;
         }
 
-        log("Extracted JSON: " + content, LogCategory.EXTRACTED_JSON);
+        log("Extracted JSON: " + findingsJsonText, LogCategory.EXTRACTED_JSON);
 
         // Parse findings JSON
-        JSONObject findingsJson = new JSONObject(content);
+        JSONObject findingsJson = new JSONObject(findingsJsonText);
 
         // Ensure findings key exists
         if (!findingsJson.has("findings")) {
@@ -3241,6 +3413,17 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
 
         // Parse findings array
         JSONArray findings = findingsJson.getJSONArray("findings");
+        int addedCount = 0;
+        int skippedWeakCount = 0;
+        int skippedUnverifiedCount = 0;
+        int skippedVerifyErrorCount = 0;
+        int premiumChecks = 0;
+
+        PremiumVerificationContext premiumContext = null;
+        if (verifyWithPremiumModel) {
+            premiumContext = resolvePremiumVerificationContext(model);
+        }
+        final String verificationEvidence = buildRequestResponseEvidenceBlock(requestResponse);
 
         for (int i = 0; i < findings.length(); i++) {
             JSONObject finding = findings.getJSONObject(i);
@@ -3271,8 +3454,30 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
             processedVulnerabilities.add(hash);
 
             // Parse severity and confidence
-            AuditIssueSeverity severity = parseSeverity(finding.getString("severity"));
-            AuditIssueConfidence confidence = parseConfidence(finding.getString("confidence"));
+            AuditIssueSeverity severity = parseSeverity(finding.optString("severity", "INFORMATION"));
+            AuditIssueConfidence confidence = parseConfidence(finding.optString("confidence", "TENTATIVE"));
+
+            if (!passesFindingQualityGate(finding, severity, confidence)) {
+                skippedWeakCount++;
+                continue;
+            }
+
+            String premiumVerificationNote = "";
+            if (verifyWithPremiumModel && premiumContext != null && premiumChecks < MAX_PREMIUM_VERIFY_PER_RESPONSE) {
+                premiumChecks++;
+                PremiumVerificationResult vr = verifyFindingWithPremiumModel(finding, verificationEvidence, premiumContext, severity, confidence);
+                if (vr == null) {
+                    skippedVerifyErrorCount++;
+                    continue;
+                }
+                if (!vr.verified) {
+                    skippedUnverifiedCount++;
+                    continue;
+                }
+                severity = vr.severity;
+                confidence = vr.confidence;
+                premiumVerificationNote = vr.reason;
+            }
 
 			// Build AIAuditIssue
 			if (requestResponse == null) {
@@ -3286,6 +3491,9 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
             issueDetail.append("__Issue identified by AI Auditor__\n\n");
             issueDetail.append("**Location:** ").append(finding.optString("location", "Unknown")).append("\n\n");
             issueDetail.append("**Detailed Explanation:**\n").append(finding.optString("explanation", "No explanation provided")).append("\n\n");
+            if (!premiumVerificationNote.isEmpty()) {
+                issueDetail.append("**Premium Verification Note:** ").append(premiumVerificationNote).append("\n\n");
+            }
             issueDetail.append("**Confidence Level:** ").append(confidence.name()).append("\n");
             issueDetail.append("**Severity Level:** ").append(severity.name());
 
@@ -3306,10 +3514,263 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
             
 			// Add issue to sitemap
             api.siteMap().add(issue);
+            addedCount++;
+        }
+
+        List<String> stats = new ArrayList<>();
+        if (skippedWeakCount > 0) {
+            stats.add(skippedWeakCount + " weak filtered");
+        }
+        if (skippedUnverifiedCount > 0) {
+            stats.add(skippedUnverifiedCount + " rejected by premium verification");
+        }
+        if (skippedVerifyErrorCount > 0) {
+            stats.add(skippedVerifyErrorCount + " premium verification error");
+        }
+        if (verifyWithPremiumModel && premiumContext == null) {
+            stats.add("premium verification unavailable");
+        }
+        if (verifyWithPremiumModel && premiumChecks >= MAX_PREMIUM_VERIFY_PER_RESPONSE) {
+            stats.add("premium verification cap reached (" + MAX_PREMIUM_VERIFY_PER_RESPONSE + ")");
+        }
+
+        if (addedCount > 0) {
+            String suffix = stats.isEmpty() ? "" : ", " + String.join(", ", stats);
+            appendDashboardActivity("AI analysis complete — " + addedCount + " finding(s) added" + suffix);
+        } else {
+            if (stats.isEmpty()) {
+                appendDashboardActivity("AI analysis complete — no findings");
+            } else {
+                appendDashboardActivity("AI analysis complete — no actionable findings (" + String.join(", ", stats) + ")");
+            }
         }
     } catch (Exception e) {
+        appendDashboardActivity("AI analysis failed — " + e.getClass().getSimpleName());
         api.logging().logToError("Error processing AI findings: " + e.getMessage());
     }
+}
+
+/**
+ * Best-effort parser for model output expected to contain a JSON object with a "findings" array.
+ * Returns null when no parseable findings JSON is present.
+ */
+private String extractFindingsJsonText(String content) {
+    if (content == null) {
+        return null;
+    }
+    String text = content.trim();
+    if (text.isEmpty()) {
+        return null;
+    }
+
+    // Try fenced code blocks first: ```json ... ``` (or ``` ... ```)
+    Pattern fencePattern = Pattern.compile("```(?:json)?\\s*\\n(.*?)\\n```", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    Matcher fenceMatcher = fencePattern.matcher(text);
+    while (fenceMatcher.find()) {
+        String candidate = fenceMatcher.group(1).trim();
+        if (hasFindingsKey(candidate)) {
+            return candidate;
+        }
+    }
+
+    // If whole response is already JSON, use it
+    if (hasFindingsKey(text)) {
+        return text;
+    }
+
+    // Fallback: trim to outermost braces and retry
+    int start = text.indexOf('{');
+    int end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+        String candidate = text.substring(start, end + 1).trim();
+        if (hasFindingsKey(candidate)) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+private boolean hasFindingsKey(String candidate) {
+    try {
+        JSONObject obj = new JSONObject(candidate);
+        return obj.has("findings") && obj.optJSONArray("findings") != null;
+    } catch (Exception ignored) {
+        return false;
+    }
+}
+
+/**
+ * Conservative gate to reduce false positives in automatic scan issue creation.
+ * Keeps only findings with stronger confidence, impact, and concrete technical evidence.
+ */
+private boolean passesFindingQualityGate(JSONObject finding, AuditIssueSeverity severity, AuditIssueConfidence confidence) {
+    if (finding == null) {
+        return false;
+    }
+    if (severity == AuditIssueSeverity.INFORMATION) {
+        return false;
+    }
+    if (confidence == AuditIssueConfidence.TENTATIVE) {
+        return false;
+    }
+    if (severity == AuditIssueSeverity.LOW && confidence != AuditIssueConfidence.CERTAIN) {
+        return false;
+    }
+
+    String title = finding.optString("vulnerability", "");
+    String location = finding.optString("location", "");
+    String explanation = finding.optString("explanation", "");
+    String exploitation = finding.optString("exploitation", "");
+    String validation = finding.optString("validation_steps", "");
+
+    if (isLikelyPlaceholder(location) || isLikelyPlaceholder(explanation) || isLikelyPlaceholder(title)) {
+        return false;
+    }
+    if (explanation.length() < 80) {
+        return false;
+    }
+
+    String evidenceText = location + "\n" + exploitation + "\n" + validation;
+    return hasConcreteTechnicalSignal(evidenceText);
+}
+
+private boolean isLikelyPlaceholder(String text) {
+    if (text == null) {
+        return true;
+    }
+    String t = text.trim().toLowerCase(Locale.ROOT);
+    return t.isEmpty()
+            || "unknown".equals(t)
+            || "n/a".equals(t)
+            || "none".equals(t)
+            || t.contains("no explanation provided");
+}
+
+private boolean hasConcreteTechnicalSignal(String text) {
+    if (text == null || text.trim().isEmpty()) {
+        return false;
+    }
+    String t = text.toLowerCase(Locale.ROOT);
+    return t.contains("http/1.1")
+            || t.contains("http/2")
+            || t.matches("(?s).*\\b(get|post|put|patch|delete|head|options)\\b.*")
+            || t.matches("(?s).*\\bstatus\\s*[:=]?\\s*\\d{3}\\b.*")
+            || t.matches("(?s).*\\b[a-z0-9_\\-]+\\s*=\\s*[^\\s]+.*")
+            || t.contains("/")
+            || t.contains("authorization")
+            || t.contains("cookie")
+            || t.contains("csrf")
+            || t.contains("samesite")
+            || t.contains("secure");
+}
+
+private PremiumVerificationContext resolvePremiumVerificationContext(String sourceModel) {
+    String premiumModel = getManualInvestigationModel();
+    if (premiumModel == null || premiumModel.trim().isEmpty() || "Default".equals(premiumModel)) {
+        return null;
+    }
+    String[] modelParts = premiumModel.split("/", 2);
+    String provider = modelParts.length == 2 ? modelParts[0] : "";
+    String apiKey = getApiKeyForModel(premiumModel);
+    if ("local".equals(provider)) {
+        if (localEndpointField == null || localEndpointField.getText().trim().isEmpty()) {
+            return null;
+        }
+    } else if (apiKey == null || apiKey.trim().isEmpty()) {
+        return null;
+    }
+    return new PremiumVerificationContext(premiumModel, apiKey);
+}
+
+private String buildRequestResponseEvidenceBlock(HttpRequestResponse requestResponse) {
+    if (requestResponse == null || requestResponse.request() == null) {
+        return "";
+    }
+    String request = requestResponse.request().toString();
+    String response = requestResponse.response() != null ? requestResponse.response().toString() : "(no response captured)";
+    return "=== HTTP request ===\n" + request + "\n\n=== HTTP response ===\n" + response;
+}
+
+private PremiumVerificationResult verifyFindingWithPremiumModel(
+        JSONObject finding,
+        String evidenceBlock,
+        PremiumVerificationContext context,
+        AuditIssueSeverity fallbackSeverity,
+        AuditIssueConfidence fallbackConfidence) {
+    if (context == null || finding == null) {
+        return null;
+    }
+    try {
+        String verificationPrompt = """
+                You are a strict application-security verifier reviewing a candidate finding generated by another model.
+                Confirm ONLY when the provided HTTP evidence supports a real issue. If uncertain, reject.
+
+                Return strict JSON only:
+                {
+                  "verified": true|false,
+                  "reason": "Short technical reason grounded in evidence",
+                  "severity": "HIGH|MEDIUM|LOW|INFORMATION",
+                  "confidence": "CERTAIN|FIRM|TENTATIVE"
+                }
+                """.stripIndent()
+                + "\n\nCandidate finding JSON:\n" + finding.toString()
+                + "\n\nEvidence:\n" + evidenceBlock;
+
+        JSONObject verificationResponse = sendToAI(context.model, context.apiKey, verificationPrompt, false);
+        String verificationText = extractContentFromResponse(verificationResponse, context.model);
+        String verificationJsonText = extractFirstJsonObjectText(verificationText);
+        if (verificationJsonText == null) {
+            return null;
+        }
+        JSONObject verification = new JSONObject(verificationJsonText);
+        boolean verified = verification.optBoolean("verified", false);
+        AuditIssueSeverity severity = parseSeverity(verification.optString("severity", fallbackSeverity.name()));
+        AuditIssueConfidence confidence = parseConfidence(verification.optString("confidence", fallbackConfidence.name()));
+        String reason = verification.optString("reason", "");
+        return new PremiumVerificationResult(verified, severity, confidence, reason);
+    } catch (Exception e) {
+        log("Premium verification error: " + e.getMessage(), LogCategory.GENERAL);
+        return null;
+    }
+}
+
+private String extractFirstJsonObjectText(String text) {
+    if (text == null) {
+        return null;
+    }
+    String trimmed = text.trim();
+    if (trimmed.isEmpty()) {
+        return null;
+    }
+    // Try direct JSON first
+    try {
+        new JSONObject(trimmed);
+        return trimmed;
+    } catch (Exception ignored) {
+    }
+
+    Pattern fencePattern = Pattern.compile("```(?:json)?\\s*\\n(.*?)\\n```", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    Matcher fenceMatcher = fencePattern.matcher(trimmed);
+    while (fenceMatcher.find()) {
+        String candidate = fenceMatcher.group(1).trim();
+        try {
+            new JSONObject(candidate);
+            return candidate;
+        } catch (Exception ignored) {
+        }
+    }
+
+    int start = trimmed.indexOf('{');
+    int end = trimmed.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+        String candidate = trimmed.substring(start, end + 1).trim();
+        try {
+            new JSONObject(candidate);
+            return candidate;
+        } catch (Exception ignored) {
+        }
+    }
+    return null;
 }
 
 
@@ -3906,6 +4367,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         }
         final String preamble = buildCombinedScannerIssuesPreamble(issuesCopy);
         log("Scanner-issue AI audit queued (batched " + issuesCopy.size() + "): " + key, LogCategory.GENERAL);
+        appendDashboardActivity("Automatic AI audit (Scanner issues, batched " + issuesCopy.size() + ") — " + truncateForIssueTitle(key, 200));
         SwingUtilities.invokeLater(() -> processAuditRequest(rr, null, false, preamble, true));
     }
 
@@ -3951,7 +4413,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         if (isShuttingDown || !passiveAiOnScannerIssues) {
             return;
         }
-        if (issue instanceof AIAuditIssue) {
+        if (isExtensionGeneratedIssue(issue)) {
             return;
         }
         List<HttpRequestResponse> rrs = issue.requestResponses();
@@ -3972,6 +4434,31 @@ private String getNextGeminiApiKey(boolean cycle) {
             String key = auditDedupKeyHostPath(req);
             scheduleScannerIssueBatchFlush(key, issue, rr);
         }
+    }
+
+    private boolean isExtensionGeneratedIssue(AuditIssue issue) {
+        if (issue == null) {
+            return false;
+        }
+        if (issue instanceof AIAuditIssue) {
+            return true;
+        }
+        String name = issue.name();
+        if (name != null) {
+            String n = name.toLowerCase(Locale.ROOT);
+            if (n.startsWith("ai audit:") || n.startsWith("ai investigate / poc")) {
+                return true;
+            }
+        }
+        String detail = issue.detail();
+        if (detail != null) {
+            String d = detail.toLowerCase(Locale.ROOT);
+            if (d.contains("__issue identified by ai auditor__")
+                    || d.contains("**ai investigation (poc / exploitation)**")) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -4222,6 +4709,7 @@ public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
         passiveAuditDedupKeys.clear();
     }
     log("Passive AI audit queued: " + req.url(), LogCategory.GENERAL);
+    appendDashboardActivity("Passive AI audit queued — " + truncateForIssueTitle(req.url(), 200));
     SwingUtilities.invokeLater(() -> processAuditRequest(baseRequestResponse, null, false, null, true));
     return AuditResult.auditResult(Collections.emptyList());
 }
