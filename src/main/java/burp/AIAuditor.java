@@ -208,6 +208,9 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private AtomicInteger currentGeminiKeyIndex = new AtomicInteger(0);
     private JTextField localEndpointField;
     private JPasswordField localKeyField;
+    /** Inline status above API keys — cloud Validate uses this so feedback is visible without opening Extension Output. */
+    private JLabel cloudApiValidationStatusLabel;
+
     /** Inline status shown under Local LLM URL Validate button. */
     private JLabel localLlmValidationStatusLabel;
     /** Models for automatic paths: Scanner issues, Proxy/Repeater browser capture, passive crawl-all. */
@@ -619,6 +622,11 @@ private void createMainTab() {
         rgbc.gridy = 0;
         root.add(connectHint, rgbc);
 
+        cloudApiValidationStatusLabel = new JLabel(" ");
+        cloudApiValidationStatusLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        rgbc.gridy = 1;
+        root.add(cloudApiValidationStatusLabel, rgbc);
+
         JPanel cred = new JPanel(new GridBagLayout());
         cred.setBorder(BorderFactory.createTitledBorder("API keys and local server"));
         GridBagConstraints gbc = new GridBagConstraints();
@@ -693,7 +701,7 @@ private void createMainTab() {
         gbc.gridwidth = 1;
         row++;
 
-        rgbc.gridy = 1;
+        rgbc.gridy = 2;
         root.add(cred, rgbc);
 
         JPanel models = new JPanel(new GridBagLayout());
@@ -777,7 +785,7 @@ private void createMainTab() {
         gbc.gridy = ++row;
         models.add(modelButtonsPanel, gbc);
 
-        rgbc.gridy = 2;
+        rgbc.gridy = 3;
         root.add(models, rgbc);
 
         saveButton = new JButton("Save Settings");
@@ -785,12 +793,12 @@ private void createMainTab() {
         saveButton.addActionListener(e -> saveSettings());
         JPanel saveWrap = new JPanel(new FlowLayout(FlowLayout.LEFT));
         saveWrap.add(saveButton);
-        rgbc.gridy = 3;
+        rgbc.gridy = 4;
         root.add(saveWrap, rgbc);
 
         GridBagConstraints filler = new GridBagConstraints();
         filler.gridx = 0;
-        filler.gridy = 4;
+        filler.gridy = 5;
         filler.weighty = 1.0;
         filler.weightx = 1.0;
         filler.fill = GridBagConstraints.BOTH;
@@ -1798,6 +1806,31 @@ private void createMainTab() {
         }
     }
 
+    private void setCloudApiValidationStatus(String text, Color color) {
+        if (cloudApiValidationStatusLabel != null) {
+            cloudApiValidationStatusLabel.setText(text);
+            cloudApiValidationStatusLabel.setForeground(color);
+        }
+    }
+
+    /** Short label for Connect-tab status lines (Validate button feedback). */
+    private static String providerDisplayName(String provider) {
+        switch (provider) {
+            case "openai":
+                return "OpenAI";
+            case "gemini":
+                return "Gemini";
+            case "claude":
+                return "Anthropic";
+            case "openrouter":
+                return "OpenRouter";
+            case "xai":
+                return "xAI (Grok)";
+            default:
+                return provider != null ? provider : "";
+        }
+    }
+
     /**
      * Checks OpenAI-compatible {@code GET {base}/models} (LM Studio, Ollama, etc.). Runs off the Swing EDT so the UI
      * stays responsive; uses the same proxy bypass rules as outbound LLM calls so localhost is not sent via Burp.
@@ -2050,6 +2083,7 @@ private void createMainTab() {
         }
 
         if (apiKey.isEmpty()) {
+            setCloudApiValidationStatus("Validation skipped: paste a key in the field first.", Color.RED);
             api.logging().raiseErrorEvent("AI Auditor: Enter an API key before clicking Validate.");
             api.logging().logToOutput("AI Auditor: Validation skipped — empty API key (" + provider + ").");
             return;
@@ -2059,31 +2093,47 @@ private void createMainTab() {
         final String endpointFinal = endpoint;
         final String jsonBodyFinal = jsonBody;
         final String providerFinal = provider;
+        final String displayName = providerDisplayName(providerFinal);
 
-        api.logging().logToOutput("AI Auditor: Validating " + providerFinal + " API key — " + endpointFinal + " (see Event Log when done).");
-
-        Runnable runValidation = () -> {
-            log(String.format("Validation Request - Provider: %s, Endpoint: %s, Body: %s, API Key (last 4 chars): ...%s",
-                    providerFinal, endpointFinal, jsonBodyFinal,
-                    apiKeyFinal.length() > 4 ? apiKeyFinal.substring(apiKeyFinal.length() - 4) : "****"),
-                    LogCategory.GENERAL);
-            boolean ok = validateApiKeyWithEndpoint(apiKeyFinal, endpointFinal, jsonBodyFinal, providerFinal);
-            SwingUtilities.invokeLater(() -> {
-                if (ok) {
-                    api.logging().raiseInfoEvent(providerFinal + " API key is valid.");
-                    api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation succeeded.");
-                } else {
-                    api.logging().raiseErrorEvent(providerFinal + " API key validation failed — check Extension Errors / Output for HTTP details.");
-                    api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation failed.");
-                }
-            });
-        };
-
-        if (threadPoolManager != null) {
-            threadPoolManager.getExecutor().execute(runValidation);
-        } else {
-            runValidation.run();
+        setCloudApiValidationStatus("Validating " + displayName + "…", new Color(180, 140, 0));
+        if (mainPanel != null) {
+            mainPanel.repaint();
         }
+
+        api.logging().logToOutput("AI Auditor: Validating " + providerFinal + " API key — " + endpointFinal + " (see Connect status line + Event Log).");
+
+        /* Use common pool so Validate is not stuck behind queued LLM work or CallerRunsPolicy on the EDT. */
+        CompletableFuture.runAsync(() -> {
+            try {
+                log(String.format("Validation Request - Provider: %s, Endpoint: %s, Body: %s, API Key (last 4 chars): ...%s",
+                        providerFinal, endpointFinal, jsonBodyFinal,
+                        apiKeyFinal.length() > 4 ? apiKeyFinal.substring(apiKeyFinal.length() - 4) : "****"),
+                        LogCategory.GENERAL);
+                boolean ok = validateApiKeyWithEndpoint(apiKeyFinal, endpointFinal, jsonBodyFinal, providerFinal);
+                SwingUtilities.invokeLater(() -> {
+                    if (ok) {
+                        setCloudApiValidationStatus(displayName + " API key is valid.", new Color(0, 130, 0));
+                        api.logging().raiseInfoEvent(providerFinal + " API key is valid.");
+                        api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation succeeded.");
+                    } else {
+                        setCloudApiValidationStatus(displayName + " validation failed — see Extension Errors for HTTP details.", Color.RED);
+                        api.logging().raiseErrorEvent(providerFinal + " API key validation failed — check Extension Errors / Output for HTTP details.");
+                        api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation failed.");
+                    }
+                    if (mainPanel != null) {
+                        mainPanel.repaint();
+                    }
+                });
+            } catch (Throwable t) {
+                SwingUtilities.invokeLater(() -> {
+                    setCloudApiValidationStatus(displayName + " validation error: " + t.getMessage(), Color.RED);
+                    api.logging().logToError("AI Auditor: validation threw: " + t.getMessage());
+                    if (mainPanel != null) {
+                        mainPanel.repaint();
+                    }
+                });
+            }
+        });
     }
     
 
