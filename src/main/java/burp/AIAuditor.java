@@ -2761,10 +2761,48 @@ private void createMainTab() {
         }).exceptionally(ex -> {
             stopHeartbeat(pocHeartbeat);
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-            appendDashboardActivity("PoC / investigation failed — " + (cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName()));
+            appendDashboardActivity("PoC / investigation failed — " + formatExceptionChainForDashboard(cause));
             showError("PoC generation failed", cause);
             return null;
         });
+    }
+
+    /**
+     * Dashboard one-liner: include nested causes so "Failed after N attempts" is not shown without the root API error.
+     */
+    private String formatExceptionChainForDashboard(Throwable t) {
+        if (t == null) {
+            return "unknown error";
+        }
+        while (t instanceof CompletionException && t.getCause() != null) {
+            t = t.getCause();
+        }
+        List<String> parts = new ArrayList<>();
+        Throwable cur = t;
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        while (cur != null && seen.size() < 8) {
+            if (!seen.add(cur)) {
+                break;
+            }
+            String msg = cur.getMessage();
+            if (msg != null && !msg.trim().isEmpty()) {
+                String oneLine = msg.replace('\n', ' ').trim();
+                if (!parts.contains(oneLine)) {
+                    parts.add(oneLine);
+                }
+            }
+            Throwable next = cur.getCause();
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        if (parts.isEmpty()) {
+            return t.getClass().getSimpleName();
+        }
+        String joined = String.join(" — ", parts);
+        int cap = 900;
+        return joined.length() > cap ? joined.substring(0, cap) + "…" : joined;
     }
 
     private boolean looksLikeFalsePositiveVerdict(String text) {
@@ -3685,7 +3723,7 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
             }
         }
     } catch (Exception e) {
-        appendDashboardActivity("AI analysis failed — " + e.getClass().getSimpleName());
+        appendDashboardActivity("AI analysis failed — " + formatExceptionChainForDashboard(e));
         api.logging().logToError("Error processing AI findings: " + e.getMessage());
     }
 }
