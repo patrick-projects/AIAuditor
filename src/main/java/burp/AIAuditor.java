@@ -136,6 +136,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
      * {@code gemma4:e4b} from {@code ollama list}).
      */
     private static final String LEGACY_LOCAL_MODEL_PLACEHOLDER = "local-llm (LM Studio)";
+    /** Shown in the Local LLM model id combo before any /v1/models refresh (Ollama-style tags). */
+    private static final String[] LOCAL_LLM_MODEL_ID_PRESETS = {"gemma4:e4b", "gemma4:26b"};
 
     /** Anthropic Messages API: room for structured JSON findings without truncating mid-response. */
     private static final int CLAUDE_MAX_OUTPUT_TOKENS = 8192;
@@ -241,7 +243,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private JTextField defaultClaudeModelField;
     private JTextField defaultOpenrouterModelField;
     private JTextField defaultXaiModelField;
-    private JTextField defaultLocalModelField;
+    /** Editable combo: presets plus ids from {@code GET /v1/models} after Validate or Get Latest Models. */
+    private JComboBox<String> defaultLocalModelCombo;
     private String cachedDefaultOpenai = "openai/gpt-4o-mini";
     private String cachedDefaultGemini = "gemini/gemini-2.0-flash-lite";
     private String cachedDefaultClaude = "claude/claude-3-5-haiku-latest";
@@ -719,15 +722,16 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.weightx = 0;
         JLabel defaultLocalLabel = new JLabel("Local LLM model id:");
-        defaultLocalModelField = new JTextField("gemma4:e4b", 24);
-        defaultLocalModelField.setToolTipText("Sent as JSON \"model\" to your Local LLM URL for every local/… request "
-                + "(automatic bulk and manual actions when you pick a local model). Ollama: a tag from `ollama list` on that host. "
-                + "LM Studio: the loaded model id in Local Server.");
-        defaultLocalLabel.setToolTipText(defaultLocalModelField.getToolTipText());
+        defaultLocalModelCombo = new JComboBox<>(LOCAL_LLM_MODEL_ID_PRESETS);
+        defaultLocalModelCombo.setEditable(true);
+        defaultLocalModelCombo.setPrototypeDisplayValue("gemma4:26b-instruct-128k");
+        defaultLocalModelCombo.setToolTipText("Pick a tag from the list (filled from GET /v1/models after you Validate the Local LLM URL or click Get Latest Models), or type any id. "
+                + "Sent as JSON \"model\" for every local/… request. Ollama: same as `ollama list`. LM Studio: Local Server model id.");
+        defaultLocalLabel.setToolTipText(defaultLocalModelCombo.getToolTipText());
         models.add(defaultLocalLabel, gbc);
         gbc.gridx = 1;
         gbc.weightx = 1.0;
-        models.add(defaultLocalModelField, gbc);
+        models.add(defaultLocalModelCombo, gbc);
         row++;
 
         gbc.gridx = 0;
@@ -1570,7 +1574,7 @@ private void createMainTab() {
                 if (dmOr != null && !dmOr.isEmpty()) defaultOpenrouterModelField.setText(dmOr);
                 if (dmXai != null && !dmXai.isEmpty()) defaultXaiModelField.setText(dmXai);
                 if (dmLocal != null && !dmLocal.isEmpty()) {
-                    defaultLocalModelField.setText(migrateLoadedLocalDefaultModelPreference(dmLocal));
+                    setDefaultLocalModelComboText(migrateLoadedLocalDefaultModelPreference(dmLocal));
                 }
 
                 migratePassiveAiPreferencesIfNeeded();
@@ -1621,66 +1625,68 @@ private void createMainTab() {
     }
     
     private String getDefaultPromptTemplate() {
-        return "You are an expert web application security researcher specializing in identifying high-impact vulnerabilities. " +
-        "Analyze the provided HTTP request and response like a skilled bug bounty hunter and maximize OWASP Top 10 coverage with evidence-backed findings.\n\n" +
-        "COVERAGE CHECKLIST:\n" +
-        "1. Injection classes: SQL, NoSQL, command, template, HTML injection, SSRF, request smuggling\n" +
-        "2. XSS classes: reflected, stored, DOM-based\n" +
-        "3. Broken access control: IDOR/object-level auth gaps, function-level auth bypasses, client-side-only controls for sensitive actions\n" +
-        "4. Auth/session weaknesses: username enumeration (login/forgot-password/registration), session not invalidated on logout, unverified email change paths\n" +
-        "5. CSRF weaknesses, including HTTP verb tampering that may bypass anti-CSRF assumptions\n" +
-        "6. Session cookie weaknesses: missing Secure, missing/weak SameSite\n" +
-        "7. Unrestricted file upload and weak input filtering/validation\n" +
-        "8. Missing rate limiting on form submissions and auth/account-recovery flows\n" +
-        "9. Open redirect behavior and phishing-assisted redirect chains\n" +
-        "10. Verbose error messages and vulnerable software version disclosure\n" +
-        "11. Exposed API keys/secrets and whether key restrictions/scopes are missing\n" +
-        "12. Dependency confusion indicators (NPM/package namespace/registry trust) when supported by response/build evidence\n\n" +
-        "ANALYSIS GUIDELINES:\n" +
-        "- Prioritize issues likely to be missed by Nessus, Nuclei, and Burp Scanner\n" +
-        "- Focus on vulnerabilities requiring deep response and flow analysis\n" +
-        "- Report API endpoints found in JS files as INFORMATION level only unless clear exploitation evidence is present\n" +
-        "- Skip theoretical issues without clear evidence\n" +
-        "- Provide specific evidence, reproduction steps or specifically crafted proof of concept\n" +
-        "- Include detailed technical context for each finding\n" +
-        "- If evidence is weak, downgrade confidence/severity rather than overstate impact\n\n" +
-               
-        "SEVERITY CRITERIA:\n" +
-        "HIGH: Immediate exploitation impact (RCE, auth bypass/account takeover, command injection, insecure deserialization, critical broken access control)\n" +
-        "MEDIUM: Significant exploitable risk with meaningful impact (including reflected XSS when evidenced, stored XSS, IDOR with scoped impact, CSRF on sensitive actions, unrestricted upload with realistic abuse)\n" +
-        "LOW: Real but limited-impact weakness with constrained exploitability\n" +
-        "INFORMATION: Useful security insights and weak signals needing more evidence\n\n" +
-          
-        "CONFIDENCE CRITERIA:\n" +
-        "CERTAIN: Over 95 percent confident with clear evidence and reproducible\n" +
-        "FIRM: Over 60 percent confident with very strong indicators but needing additional validation\n" +
-        "TENTATIVE: At least 50 percent confident with indicators warranting further investigation\n\n" +
-             
-        "Format findings as JSON with the following structure:\n" +
-            "{\n" +
-            "  \"findings\": [{\n" +
-            "    \"vulnerability\": \"Clear, specific, concise title of issue\",\n" +
-            "    \"location\": \"Exact location in request/response (parameter, header, or path)\",\n" +
-            "    \"explanation\": \"Detailed technical explanation with evidence from the request/response\",\n" +
-            "    \"exploitation\": \"Specific steps to reproduce/exploit\",\n" +
-            "    \"validation_steps\": \"Steps to validate the finding\",\n" +
-            "    \"severity\": \"HIGH|MEDIUM|LOW|INFORMATION\",\n" +
-            "    \"confidence\": \"CERTAIN|FIRM|TENTATIVE\"\n" +
-            "  }]\n" +
-            "}\n\n" +
-            
-            "IMPORTANT:\n" +
-            "- Only report findings with clear evidence in the request/response\n" +
-            "- Issues below 50 percent confidence should not be reported unless severity is HIGH\n" +
-            "- Treat reflected XSS as at least MEDIUM when evidence is present (do not classify reflected XSS as LOW)\n" +
-            "- Include specific paths, parameters, headers, and behavioral deltas that indicate the vulnerability\n" +
-            "- For OAuth/authorization/session issues, analyze token handling, role boundaries, logout invalidation, and account-change flows\n" +
-            "- For injection points, provide exact payload locations and at least one concrete payload example in validation_steps\n" +
-            "- Do not report low-signal findings like missing headers alone unless they materially enable exploitation\n" +
-            "- Mask sensitive values in output: never include full credit card/PAN, SSN/SIN, auth tokens, session IDs, API keys, or secrets\n" +
-            "- For sensitive info disclosure, reference location and type of data while redacting values\n" +
-            "- In each finding, the \"exploitation\" and \"validation_steps\" fields must include concrete payloads, parameters, or raw HTTP fragments—not generic advice.\n" +
-            "- Only return JSON with findings, no other content!";
+        return """
+                You are an expert web application security researcher specializing in identifying high-impact vulnerabilities. Analyze the provided HTTP request and response like a skilled bug bounty hunter and maximize OWASP Top 10 coverage with evidence-backed findings.
+
+                COVERAGE CHECKLIST:
+                1. Injection classes: SQL, NoSQL, command, template, HTML injection, SSRF, request smuggling
+                2. XSS classes: reflected, stored, DOM-based
+                3. Client-side-only controls for sensitive actions
+                4. Auth/session weaknesses: username enumeration (login/forgot-password/registration), session not invalidated on logout, unverified email change paths
+                5. CSRF weaknesses, only including HTTP verb tampering that may bypass anti-CSRF assumptions
+                6. Session cookie weaknesses: missing Secure, missing/weak SameSite
+                7. Unrestricted file upload and weak input filtering/validation
+                9. Open redirect behavior and phishing-assisted redirect chains
+                10. Verbose error messages and vulnerable software version disclosure
+                11. Exposed API keys/secrets and whether key restrictions/scopes are missing
+                12. Dependency confusion indicators (NPM/package namespace/registry trust) when supported by response/build evidence
+
+                ANALYSIS GUIDELINES:
+                - Prioritize issues likely to be missed by Nessus, Nuclei, and Burp Scanner
+                - Focus on vulnerabilities requiring deep response and flow analysis
+                - Report API endpoints found in JS files as INFORMATION level only unless clear exploitation evidence is present
+                - Skip theoretical issues without clear evidence
+                - Provide specific evidence, reproduction steps or specifically crafted proof of concept
+                - Include detailed technical context for each finding
+                - If evidence is weak, downgrade confidence/severity rather than overstate impact
+
+                SEVERITY CRITERIA:
+                HIGH: Immediate exploitation impact (RCE, auth bypass/account takeover, command injection, insecure deserialization, critical broken access control)
+                MEDIUM: Significant exploitable risk with meaningful impact (including reflected XSS when evidenced, stored XSS, IDOR with scoped impact, CSRF on sensitive actions, unrestricted upload with realistic abuse)
+                LOW: Real but limited-impact weakness with constrained exploitability
+                INFORMATION: Useful security insights and weak signals needing more evidence
+
+                CONFIDENCE CRITERIA:
+                CERTAIN: Over 95 percent confident with clear evidence and reproducible
+                FIRM: Over 60 percent confident with very strong indicators but needing additional validation
+                TENTATIVE: At least 50 percent confident with indicators warranting further investigation
+
+                Format findings as JSON with the following structure:
+                {
+                  "findings": [{
+                    "vulnerability": "Clear, specific, concise title of issue",
+                    "location": "Exact location in request/response (parameter, header, or path)",
+                    "explanation": "Detailed technical explanation with evidence from the request/response",
+                    "exploitation": "Specific steps to reproduce/exploit",
+                    "validation_steps": "Steps to validate the finding",
+                    "severity": "HIGH|MEDIUM|LOW|INFORMATION",
+                    "confidence": "CERTAIN|FIRM|TENTATIVE"
+                  }]
+                }
+
+                IMPORTANT:
+                - Only report findings with clear evidence in the request/response
+                - Issues below 50 percent confidence should not be reported unless severity is HIGH
+                - Treat reflected XSS as at least MEDIUM when evidence is present (do not classify reflected XSS as LOW)
+                - Include specific paths, parameters, headers, and behavioral deltas that indicate the vulnerability
+                - For OAuth/authorization/session issues, analyze token handling, role boundaries, logout invalidation, and account-change flows
+                - For injection points, provide exact payload locations and at least one concrete payload example in validation_steps
+                - Do not report low-signal findings like missing headers alone unless they materially enable exploitation
+                - Mask sensitive values in output: never include full credit card/PAN, SSN/SIN, auth tokens, session IDs, API keys, or secrets
+                - For sensitive info disclosure, reference location and type of data while redacting values
+                - In each finding, the "exploitation" and "validation_steps" fields must include concrete payloads, parameters, or raw HTTP fragments—not generic advice.
+                - Only return JSON with findings, no other content!
+                """.stripIndent();
     }
 
     private String getDefaultExplainMeThisPrompt() {
@@ -1822,6 +1828,7 @@ private void createMainTab() {
                     setLocalLlmValidationStatus("Validated: /models responded OK.", new Color(0, 130, 0));
                     api.logging().raiseInfoEvent("Local LLM URL is valid (/models responded OK).");
                     api.logging().logToOutput("AI Auditor: Local LLM validation succeeded.");
+                    scheduleLocalModelIdDropdownRefresh();
                 } else {
                     setLocalLlmValidationStatus("Validation failed. See Event Log/Output for details.", Color.RED);
                     api.logging().raiseErrorEvent(
@@ -1838,22 +1845,171 @@ private void createMainTab() {
         }
     }
 
+    /**
+     * Reads {@code GET {Local LLM URL}/models} (OpenAI-compatible) and returns each entry's {@code id}.
+     */
+    private List<String> fetchLocalOpenAiModelsList() {
+        List<String> out = new ArrayList<>();
+        String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
+        if (base.isEmpty()) {
+            return out;
+        }
+        String normalized = base.replaceAll("/+$", "");
+        String endpoint = normalized + "/models";
+        String apiKey = localKeyField != null ? new String(localKeyField.getPassword()).trim() : "";
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(endpoint);
+            conn = openValidationConnection(url);
+            conn.setRequestMethod("GET");
+            if (!apiKey.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+            }
+            if (conn.getResponseCode() != 200) {
+                return out;
+            }
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    sb.append(line);
+                }
+            }
+            JSONObject root = new JSONObject(sb.toString());
+            JSONArray data = root.optJSONArray("data");
+            if (data == null) {
+                return out;
+            }
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject o = data.optJSONObject(i);
+                if (o == null || !o.has("id")) {
+                    continue;
+                }
+                String id = o.getString("id");
+                if (id != null && !id.isEmpty()) {
+                    out.add(id);
+                }
+            }
+        } catch (Exception e) {
+            log("Could not list local LLM models (" + endpoint + "): " + e.getMessage(), LogCategory.GENERAL);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+        return out;
+    }
+
+    private void scheduleLocalModelIdDropdownRefresh() {
+        Runnable task = () -> {
+            List<String> ids = fetchLocalOpenAiModelsList();
+            SwingUtilities.invokeLater(() -> mergeLocalModelIdsIntoDropdown(ids));
+        };
+        if (threadPoolManager != null) {
+            threadPoolManager.getExecutor().execute(task);
+        } else {
+            task.run();
+        }
+    }
+
+    /**
+     * Rebuilds the Local LLM model id combo: common Gemma 4 presets first, then {@code gemma4…} tags from the server,
+     * then other ids (so LM Studio / other models still appear if you do not use Gemma 4).
+     */
+    private void mergeLocalModelIdsIntoDropdown(List<String> fromServer) {
+        if (defaultLocalModelCombo == null) {
+            return;
+        }
+        String previous = getDefaultLocalModelComboText();
+        LinkedHashSet<String> ordered = new LinkedHashSet<>();
+        for (String preset : LOCAL_LLM_MODEL_ID_PRESETS) {
+            ordered.add(preset);
+        }
+        List<String> gemma4 = new ArrayList<>();
+        List<String> other = new ArrayList<>();
+        if (fromServer != null) {
+            for (String id : fromServer) {
+                if (id == null || id.isEmpty()) {
+                    continue;
+                }
+                if (id.toLowerCase(Locale.ROOT).contains("gemma4")) {
+                    gemma4.add(id);
+                } else {
+                    other.add(id);
+                }
+            }
+        }
+        Collections.sort(gemma4);
+        Collections.sort(other);
+        ordered.addAll(gemma4);
+        final int maxOther = 48;
+        for (int i = 0; i < other.size() && i < maxOther; i++) {
+            ordered.add(other.get(i));
+        }
+        defaultLocalModelCombo.removeAllItems();
+        for (String id : ordered) {
+            defaultLocalModelCombo.addItem(id);
+        }
+        setDefaultLocalModelComboText(previous);
+        if (fromServer != null && !fromServer.isEmpty()) {
+            log("Local LLM model id list updated (" + fromServer.size() + " from /v1/models).", LogCategory.GENERAL);
+        }
+    }
+
+    private String getDefaultLocalModelComboText() {
+        if (defaultLocalModelCombo == null) {
+            return "";
+        }
+        if (defaultLocalModelCombo.isEditable()) {
+            Component ed = defaultLocalModelCombo.getEditor().getEditorComponent();
+            if (ed instanceof JTextField) {
+                return ((JTextField) ed).getText().trim();
+            }
+        }
+        Object sel = defaultLocalModelCombo.getSelectedItem();
+        return sel != null ? sel.toString().trim() : "";
+    }
+
+    private void setDefaultLocalModelComboText(String value) {
+        if (defaultLocalModelCombo == null) {
+            return;
+        }
+        String v = value != null ? value.trim() : "";
+        for (int i = 0; i < defaultLocalModelCombo.getItemCount(); i++) {
+            if (v.equals(defaultLocalModelCombo.getItemAt(i))) {
+                defaultLocalModelCombo.setSelectedIndex(i);
+                return;
+            }
+        }
+        if (defaultLocalModelCombo.isEditable()) {
+            Component ed = defaultLocalModelCombo.getEditor().getEditorComponent();
+            if (ed instanceof JTextField) {
+                ((JTextField) ed).setText(v);
+            }
+            defaultLocalModelCombo.getEditor().setItem(v);
+        }
+    }
+
     private void validateApiKey(String provider) {
+        if ("local".equals(provider)) {
+            validateLocalLlmEndpoint();
+            return;
+        }
+
         String apiKey = "";
         String endpoint = "";
         String jsonBody = "";
-        boolean isValid = false;
-    
+
         try {
             switch (provider) {
                 case "openai":
-                    apiKey = openaiKeyField.getText();
+                    apiKey = new String(openaiKeyField.getPassword()).trim();
                     endpoint = "https://api.openai.com/v1/models";
                     break;
-    
+
                 case "gemini":
-					refreshGeminiApiKeys();
-                    apiKey = geminiKeyField.getText().split("\n")[0].trim(); // For validation, use the first key
+                    refreshGeminiApiKeys();
+                    apiKey = geminiKeyField.getText().split("\n")[0].trim();
                     endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
                     jsonBody = "{"
                              + "  \"contents\": ["
@@ -1861,10 +2017,9 @@ private void createMainTab() {
                              + "  ]"
                              + "}";
                     break;
-                
-    
+
                 case "claude":
-                    apiKey = claudeKeyField.getText();
+                    apiKey = new String(claudeKeyField.getPassword()).trim();
                     endpoint = "https://api.anthropic.com/v1/messages";
                     jsonBody = "{"
                              + "  \"model\": \"claude-3-5-sonnet-latest\","
@@ -1876,37 +2031,58 @@ private void createMainTab() {
                     break;
 
                 case "openrouter":
-                    apiKey = openrouterKeyField.getText();
+                    apiKey = new String(openrouterKeyField.getPassword()).trim();
                     endpoint = "https://openrouter.ai/api/v1/models";
                     break;
 
                 case "xai":
-                    apiKey = new String(xaiKeyField.getPassword());
+                    apiKey = new String(xaiKeyField.getPassword()).trim();
                     endpoint = "https://api.x.ai/v1/models";
                     break;
-
-                case "local":
-                    validateLocalLlmEndpoint();
-                    return;
 
                 default:
                     JOptionPane.showMessageDialog(mainPanel, "Unknown provider: " + provider, "Validation Error", JOptionPane.ERROR_MESSAGE);
                     return;
             }
-    
-            // Log request details for debugging
-            log(String.format("Validation Request - Provider: %s, Endpoint: %s, Body: %s, API Key (last 4 chars): ...%s",
-                provider, endpoint, jsonBody, apiKey.length() > 4 ? apiKey.substring(apiKey.length() - 4) : apiKey), LogCategory.GENERAL);
-
-            // Validate API key
-            isValid = validateApiKeyWithEndpoint(apiKey, endpoint, jsonBody, provider);
-    
-            // Display result
-            String message = isValid ? provider + " API key is valid" : provider + " API key validation failed";
-            api.logging().raiseInfoEvent(message);
-    
         } catch (Exception e) {
             showError("Error validating API key for " + provider, e);
+            return;
+        }
+
+        if (apiKey.isEmpty()) {
+            api.logging().raiseErrorEvent("AI Auditor: Enter an API key before clicking Validate.");
+            api.logging().logToOutput("AI Auditor: Validation skipped — empty API key (" + provider + ").");
+            return;
+        }
+
+        final String apiKeyFinal = apiKey;
+        final String endpointFinal = endpoint;
+        final String jsonBodyFinal = jsonBody;
+        final String providerFinal = provider;
+
+        api.logging().logToOutput("AI Auditor: Validating " + providerFinal + " API key — " + endpointFinal + " (see Event Log when done).");
+
+        Runnable runValidation = () -> {
+            log(String.format("Validation Request - Provider: %s, Endpoint: %s, Body: %s, API Key (last 4 chars): ...%s",
+                    providerFinal, endpointFinal, jsonBodyFinal,
+                    apiKeyFinal.length() > 4 ? apiKeyFinal.substring(apiKeyFinal.length() - 4) : "****"),
+                    LogCategory.GENERAL);
+            boolean ok = validateApiKeyWithEndpoint(apiKeyFinal, endpointFinal, jsonBodyFinal, providerFinal);
+            SwingUtilities.invokeLater(() -> {
+                if (ok) {
+                    api.logging().raiseInfoEvent(providerFinal + " API key is valid.");
+                    api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation succeeded.");
+                } else {
+                    api.logging().raiseErrorEvent(providerFinal + " API key validation failed — check Extension Errors / Output for HTTP details.");
+                    api.logging().logToOutput("AI Auditor: " + providerFinal + " API key validation failed.");
+                }
+            });
+        };
+
+        if (threadPoolManager != null) {
+            threadPoolManager.getExecutor().execute(runValidation);
+        } else {
+            runValidation.run();
         }
     }
     
@@ -2600,7 +2776,7 @@ private void createMainTab() {
      */
     private String resolveOpenAiCompatibleLocalModelId(String dropdownModelSuffix) throws IllegalArgumentException {
         String legacy = LEGACY_LOCAL_MODEL_PLACEHOLDER;
-        String fromField = defaultLocalModelField != null ? defaultLocalModelField.getText().trim() : "";
+        String fromField = getDefaultLocalModelComboText();
         if (!fromField.isEmpty() && !fromField.equalsIgnoreCase(legacy)) {
             if (fromField.contains("/")) {
                 fromField = fromField.substring(fromField.indexOf('/') + 1).trim();
@@ -3439,7 +3615,7 @@ private String getNextGeminiApiKey(boolean cycle) {
         cachedDefaultXai = normalizeDefaultModelLine("xai",
                 defaultXaiModelField != null ? defaultXaiModelField.getText() : null, "xai/grok-4-1-fast-non-reasoning");
         cachedDefaultLocal = normalizeDefaultModelLine("local",
-                defaultLocalModelField != null ? defaultLocalModelField.getText() : null, "local/gemma4:e4b");
+                defaultLocalModelCombo != null ? getDefaultLocalModelComboText() : null, "local/gemma4:e4b");
     }
 
     private static String passiveContentTypeLower(HttpResponse response) {
@@ -4214,9 +4390,11 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
                 CompletableFuture<List<String>> claudeFuture = fetchClaudeModels(new String(claudeKeyField.getPassword()));
                 CompletableFuture<List<String>> openrouterFuture = fetchOpenRouterModels(new String(openrouterKeyField.getPassword()));
                 CompletableFuture<List<String>> xaiFuture = fetchXaiModels(new String(xaiKeyField.getPassword()));
+                CompletableFuture<List<String>> localModelsFuture = CompletableFuture.supplyAsync(
+                        this::fetchLocalOpenAiModelsList, threadPoolManager.getExecutor());
 
                 // Wait for all futures to complete
-                CompletableFuture.allOf(openaiFuture, geminiFuture, claudeFuture, openrouterFuture, xaiFuture).join();
+                CompletableFuture.allOf(openaiFuture, geminiFuture, claudeFuture, openrouterFuture, xaiFuture, localModelsFuture).join();
 
                 // Collect results and add to availableModels
                 try {
@@ -4245,6 +4423,13 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
                     log("Failed to fetch xAI models: " + e.getMessage(), LogCategory.GENERAL);
                 }
 
+                List<String> localOpenAiModelIds = new ArrayList<>();
+                try {
+                    localOpenAiModelIds.addAll(localModelsFuture.get());
+                } catch (Exception e) {
+                    log("Failed to fetch local LLM /v1/models list: " + e.getMessage(), LogCategory.GENERAL);
+                }
+
                 // Sort models alphabetically, excluding "Default" and "local-llm (LM Studio)"
                 List<String> sortedModels = new ArrayList<>();
                 for (String model : availableModels) {
@@ -4260,8 +4445,10 @@ public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue exi
                 availableModels.add("local/local-llm (LM Studio)"); // Always add local-llm last
                 availableModels.addAll(sortedModels);
 
+                final List<String> localIdsForUi = localOpenAiModelIds;
                 SwingUtilities.invokeLater(() -> {
                     applyModelFilter(); // Apply filter after updating the full list
+                    mergeLocalModelIdsIntoDropdown(localIdsForUi);
                     log("Model list updated with the latest models.", LogCategory.GENERAL);
                 });
 
