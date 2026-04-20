@@ -147,6 +147,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int MAX_AUTO_POC_REQUESTS = 8;
     /** Limit premium verification calls per parsed response to control cost/latency. */
     private static final int MAX_PREMIUM_VERIFY_PER_RESPONSE = 4;
+    private static final String FALSE_POSITIVE_PREFIX = "False Positive (AI Review): ";
     private static final long TIMING_SQLI_DELAY_MS = 4500L;
     private static final long TIMING_SQLI_THRESHOLD_MS = 3000L;
     private static final int OOB_POLL_ROUNDS = 5;
@@ -237,6 +238,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 	 private JLabel completedTasksLabel;
     /** Rolling log on the Dashboard tab (PoC, manual audits, passive hooks). */
     private JTextArea dashboardActivityArea;
+    /** Optional collapsible pane for business-logic testing suggestions. */
+    private JTextArea dashboardBusinessLogicArea;
+    private JPanel dashboardBusinessLogicContentPanel;
+    private JButton dashboardBusinessLogicToggleButton;
     private static final int DASHBOARD_ACTIVITY_MAX_LINES = 400;
 	 private AtomicInteger completedTasksCounter = new AtomicInteger(0);
 
@@ -282,6 +287,7 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private final Set<String> passiveAuditDedupKeys = ConcurrentHashMap.newKeySet();
     private final Set<String> proxyBrowserAiDedupKeys = ConcurrentHashMap.newKeySet();
     private final Map<String, ActiveHostRequestBudget> activeHostRequestBudgets = new ConcurrentHashMap<>();
+    private volatile long lastActiveNullServiceLogMs = 0L;
 
     private static final class PendingScannerIssueBatch {
         final List<AuditIssue> issues = new ArrayList<>();
@@ -1308,7 +1314,53 @@ private void createMainTab() {
         gbc.insets = new Insets(4, 8, 8, 8);
         panel.add(controls, gbc);
 
+        // Collapsible drawer to keep optional analysis out of the main dashboard flow.
+        gbc.gridy = 6;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weighty = 0;
+        gbc.insets = new Insets(0, 8, 8, 8);
+        panel.add(buildDashboardBusinessLogicDrawer(panel), gbc);
+
         return panel;
+    }
+
+    private JPanel buildDashboardBusinessLogicDrawer(JPanel dashboardRoot) {
+        JPanel wrap = new JPanel(new BorderLayout(0, 6));
+        wrap.setBorder(BorderFactory.createTitledBorder("Optional analysis"));
+
+        dashboardBusinessLogicToggleButton = new JButton("▶ Business logic suggestions (Local LLM)");
+        dashboardBusinessLogicToggleButton.setFocusPainted(false);
+        dashboardBusinessLogicToggleButton.setHorizontalAlignment(SwingConstants.LEFT);
+        wrap.add(dashboardBusinessLogicToggleButton, BorderLayout.NORTH);
+
+        dashboardBusinessLogicArea = new JTextArea(8, 70);
+        dashboardBusinessLogicArea.setEditable(false);
+        dashboardBusinessLogicArea.setLineWrap(true);
+        dashboardBusinessLogicArea.setWrapStyleWord(true);
+        dashboardBusinessLogicArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        dashboardBusinessLogicArea.setBackground(new Color(28, 31, 37));
+        dashboardBusinessLogicArea.setForeground(new Color(220, 225, 230));
+        dashboardBusinessLogicArea.setCaretColor(new Color(220, 225, 230));
+        dashboardBusinessLogicArea.setSelectionColor(new Color(60, 76, 107));
+        dashboardBusinessLogicArea.setSelectedTextColor(Color.WHITE);
+        dashboardBusinessLogicArea.setText("Suggestions are hidden by default to keep this dashboard clean.\n"
+                + "When enabled, this panel will show local-LLM hypotheses for business-logic tests.");
+
+        dashboardBusinessLogicContentPanel = new JPanel(new BorderLayout(0, 6));
+        dashboardBusinessLogicContentPanel.add(new JScrollPane(dashboardBusinessLogicArea), BorderLayout.CENTER);
+        dashboardBusinessLogicContentPanel.setVisible(false);
+        wrap.add(dashboardBusinessLogicContentPanel, BorderLayout.CENTER);
+
+        dashboardBusinessLogicToggleButton.addActionListener(e -> {
+            boolean expand = !dashboardBusinessLogicContentPanel.isVisible();
+            dashboardBusinessLogicContentPanel.setVisible(expand);
+            dashboardBusinessLogicToggleButton.setText(
+                    (expand ? "▼ " : "▶ ") + "Business logic suggestions (Local LLM)");
+            dashboardRoot.revalidate();
+            dashboardRoot.repaint();
+        });
+
+        return wrap;
     }
 
     private void appendDashboardActivity(String line) {
@@ -2669,7 +2721,10 @@ private void createMainTab() {
             if (text == null || text.isEmpty()) {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
-            String autoExecutionSummary = executeGeneratedPocRequests(text, reqRes);
+            boolean likelyFalsePositive = looksLikeFalsePositiveVerdict(text);
+            String autoExecutionSummary = likelyFalsePositive
+                    ? "\n\n---\nAuto-execution skipped: investigation verdict suggests likely false positive."
+                    : executeGeneratedPocRequests(text, reqRes);
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
                     + text + autoExecutionSummary;
             if (shouldAddIssue) {
@@ -2678,12 +2733,18 @@ private void createMainTab() {
                 AuditIssueConfidence finalConfidence = AuditIssueConfidence.TENTATIVE;
                 if (replacementSourceIssue != null) {
                     // Keep the same issue identity so consolidation can replace the previous entry.
-                    finalIssueName = replacementSourceIssue.name();
+                    finalIssueName = clearFalsePositivePrefix(replacementSourceIssue.name());
                     if (replacementSourceIssue.severity() != null) {
                         finalSeverity = replacementSourceIssue.severity();
                     }
                     if (replacementSourceIssue.confidence() != null) {
                         finalConfidence = replacementSourceIssue.confidence();
+                    }
+                    if (likelyFalsePositive) {
+                        finalIssueName = markIssueAsFalsePositive(finalIssueName);
+                        finalSeverity = AuditIssueSeverity.INFORMATION;
+                        finalConfidence = AuditIssueConfidence.TENTATIVE;
+                        detail = "**Investigation verdict:** LIKELY FALSE POSITIVE\n\n" + detail;
                     }
                 }
                 AIAuditIssue issue = new AIAuditIssue.Builder()
@@ -2711,6 +2772,30 @@ private void createMainTab() {
             showError("PoC generation failed", cause);
             return null;
         });
+    }
+
+    private boolean looksLikeFalsePositiveVerdict(String text) {
+        if (text == null) {
+            return false;
+        }
+        String t = text.toLowerCase(Locale.ROOT);
+        return t.contains("likely false positive")
+                || t.contains("false positive")
+                || t.contains("weaker variant");
+    }
+
+    private String markIssueAsFalsePositive(String name) {
+        String base = clearFalsePositivePrefix(name);
+        return FALSE_POSITIVE_PREFIX + base;
+    }
+
+    private String clearFalsePositivePrefix(String name) {
+        if (name == null) {
+            return "";
+        }
+        return name.startsWith(FALSE_POSITIVE_PREFIX)
+                ? name.substring(FALSE_POSITIVE_PREFIX.length()).trim()
+                : name;
     }
 
     private String executeGeneratedPocRequests(String aiText, HttpRequestResponse sourceRequestResponse) {
@@ -4577,6 +4662,11 @@ public AuditResult activeAudit(HttpRequestResponse baseRequestResponse, AuditIns
 private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResponse, HttpRequest baseRequest, AuditInsertionPoint insertionPoint,
         AtomicInteger insertionRequestCount) {
     List<AuditIssue> issues = new ArrayList<>();
+    HttpService fallbackService = baseRequest != null ? baseRequest.httpService() : null;
+    if (fallbackService == null || fallbackService.host() == null || fallbackService.host().isEmpty()) {
+        logActiveNullServiceThrottled("Timing SQLi check skipped: base request has no HTTP service.");
+        return issues;
+    }
     String[] timingPayloads = {
             "'; WAITFOR DELAY '0:0:5'--",
             "' OR SLEEP(5)-- ",
@@ -4590,6 +4680,7 @@ private List<AuditIssue> runTimingSqliChecks(HttpRequestResponse baseRequestResp
     for (String payload : timingPayloads) {
         try {
             HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
+            requestWithPayload = ensureHttpService(requestWithPayload, fallbackService);
             List<Long> injected = measureTimings(requestWithPayload, insertionRequestCount, 2);
             if (injected.size() < 2) {
                 break;
@@ -4642,6 +4733,7 @@ private List<AuditIssue> runSingleOobCheck(HttpRequestResponse baseRequestRespon
     List<AuditIssue> issues = new ArrayList<>();
     try {
         HttpRequest requestWithPayload = insertionPoint.buildHttpRequestWithPayload(ByteArray.byteArray(payload));
+        requestWithPayload = ensureHttpService(requestWithPayload, baseRequest != null ? baseRequest.httpService() : null);
         HttpRequestResponse sent = sendActiveAuditRequest(requestWithPayload, insertionRequestCount);
         if (sent == null) {
             return issues;
@@ -4727,6 +4819,14 @@ private long medianMs(List<Long> values) {
 }
 
 private HttpRequestResponse sendActiveAuditRequest(HttpRequest request, AtomicInteger insertionRequestCount) throws Exception {
+    if (request == null) {
+        return null;
+    }
+    HttpService svc = request.httpService();
+    if (svc == null || svc.host() == null || svc.host().isEmpty()) {
+        logActiveNullServiceThrottled("Active check skipped: HTTP service cannot be resolved for generated request.");
+        return null;
+    }
     if (!tryConsumeActiveBudget(request, insertionRequestCount)) {
         return null;
     }
@@ -4737,16 +4837,46 @@ private boolean tryConsumeActiveBudget(HttpRequest request, AtomicInteger insert
     if (request == null) {
         return false;
     }
+    HttpService svc = request.httpService();
+    if (svc == null || svc.host() == null || svc.host().isEmpty()) {
+        return false;
+    }
     if (insertionRequestCount.incrementAndGet() > ACTIVE_SCAN_MAX_REQUESTS_PER_INSERTION) {
         return false;
     }
-    HttpService svc = request.httpService();
-    String host = svc != null && svc.host() != null ? svc.host().toLowerCase(Locale.ROOT) : "<unknown>";
+    String host = svc.host().toLowerCase(Locale.ROOT);
     ActiveHostRequestBudget budget = activeHostRequestBudgets.computeIfAbsent(host, h -> new ActiveHostRequestBudget());
     if (!budget.tryConsumeOne()) {
         return false;
     }
     return true;
+}
+
+private HttpRequest ensureHttpService(HttpRequest request, HttpService fallbackService) {
+    if (request == null) {
+        return null;
+    }
+    HttpService svc = request.httpService();
+    if (svc != null && svc.host() != null && !svc.host().isEmpty()) {
+        return request;
+    }
+    if (fallbackService == null || fallbackService.host() == null || fallbackService.host().isEmpty()) {
+        return request;
+    }
+    try {
+        return HttpRequest.httpRequest(fallbackService, request.toString());
+    } catch (Exception e) {
+        logActiveNullServiceThrottled("Could not apply fallback HTTP service to generated request: " + e.getMessage());
+        return request;
+    }
+}
+
+private void logActiveNullServiceThrottled(String message) {
+    long now = System.currentTimeMillis();
+    if (now - lastActiveNullServiceLogMs >= 30_000L) {
+        lastActiveNullServiceLogMs = now;
+        log(message, LogCategory.GENERAL);
+    }
 }
 
 private static final class ActiveHostRequestBudget {
