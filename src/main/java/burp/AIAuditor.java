@@ -159,6 +159,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     /** Validation HTTP calls use short timeouts so the UI does not hang on unreachable hosts. */
     private static final int VALIDATION_CONNECT_MS = 15000;
     private static final int VALIDATION_READ_MS = 25000;
+    /** Request timeout defaults: keep cloud responsive while allowing slower local model generation. */
+    private static final int AI_CONNECT_TIMEOUT_MS = 15000;
+    private static final int AI_READ_TIMEOUT_CLOUD_MS = 90000;
+    private static final int AI_READ_TIMEOUT_LOCAL_MS = 360000;
 
     private static final String PROXY_BROWSER_LOCAL_AI_TOOLTIP =
             "Unlike “broad passive HTTP”, this is only responses from Burp’s Proxy tool (and Repeater if enabled) — i.e. traffic sent through your listener, not every passive-scan hit site-wide. "
@@ -312,6 +316,11 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private final ConcurrentHashMap<String, PendingScannerIssueBatch> pendingScannerIssueBatches = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scannerIssueDebounceScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ai-auditor-scanner-issue-debounce");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ScheduledExecutorService dashboardHeartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ai-auditor-dashboard-heartbeat");
         t.setDaemon(true);
         return t;
     });
@@ -576,6 +585,15 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
             }
         } catch (InterruptedException e) {
             scannerIssueDebounceScheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        dashboardHeartbeatScheduler.shutdown();
+        try {
+            if (!dashboardHeartbeatScheduler.awaitTermination(2, TimeUnit.SECONDS)) {
+                dashboardHeartbeatScheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            dashboardHeartbeatScheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
@@ -1348,6 +1366,30 @@ private void createMainTab() {
             log("Dashboard activity log copied to clipboard.", LogCategory.GENERAL);
         } catch (Exception ex) {
             api.logging().logToError("Could not copy activity log to clipboard: " + ex.getMessage());
+        }
+    }
+
+    private ScheduledFuture<?> startPocHeartbeat(String model, String findingName) {
+        if (dashboardHeartbeatScheduler.isShutdown()) {
+            return null;
+        }
+        final long startedAtMs = System.currentTimeMillis();
+        final String title = truncateForIssueTitle(findingName, 80);
+        try {
+            return dashboardHeartbeatScheduler.scheduleAtFixedRate(() -> {
+                long elapsedSec = Math.max(0, (System.currentTimeMillis() - startedAtMs) / 1000);
+                appendDashboardActivity("PoC / investigation still running — " + model + " — " + title
+                        + " (" + elapsedSec + "s elapsed)");
+            }, 30, 30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log("Could not start PoC heartbeat: " + e.getMessage(), LogCategory.GENERAL);
+            return null;
+        }
+    }
+
+    private void stopHeartbeat(ScheduledFuture<?> heartbeat) {
+        if (heartbeat != null) {
+            heartbeat.cancel(false);
         }
     }
 
@@ -2608,6 +2650,7 @@ private void createMainTab() {
         final AuditIssue replacementSourceIssue = sourceIssueForReplacement;
 
         appendDashboardActivity("PoC / investigation started — " + model + " — " + truncateForIssueTitle(findingName, 120));
+        final ScheduledFuture<?> pocHeartbeat = startPocHeartbeat(model, findingName);
 
         CompletableFuture.supplyAsync(() -> {
             try {
@@ -2616,6 +2659,7 @@ private void createMainTab() {
                 throw new CompletionException(e);
             }
         }, threadPoolManager.getExecutor()).thenAccept(aiResponse -> {
+            stopHeartbeat(pocHeartbeat);
             String text;
             try {
                 text = extractContentFromResponse(aiResponse, model);
@@ -2625,7 +2669,7 @@ private void createMainTab() {
             if (text == null || text.isEmpty()) {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
-            String autoExecutionSummary = executeGeneratedPocRequests(text);
+            String autoExecutionSummary = executeGeneratedPocRequests(text, reqRes);
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
                     + text + autoExecutionSummary;
             if (shouldAddIssue) {
@@ -2661,6 +2705,7 @@ private void createMainTab() {
                 appendDashboardActivity("PoC / investigation finished — result generated in Extension Output");
             }
         }).exceptionally(ex -> {
+            stopHeartbeat(pocHeartbeat);
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
             appendDashboardActivity("PoC / investigation failed — " + (cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName()));
             showError("PoC generation failed", cause);
@@ -2668,7 +2713,7 @@ private void createMainTab() {
         });
     }
 
-    private String executeGeneratedPocRequests(String aiText) {
+    private String executeGeneratedPocRequests(String aiText, HttpRequestResponse sourceRequestResponse) {
         List<String> requests = extractHttpRequestsFromMarkdown(aiText);
         if (requests.isEmpty()) {
             return "\n\n---\nAuto-execution: No parseable raw HTTP requests found in the PoC output.";
@@ -2677,10 +2722,17 @@ private void createMainTab() {
         int cap = Math.min(MAX_AUTO_POC_REQUESTS, requests.size());
         int sent = 0;
         List<String> lines = new ArrayList<>();
+        HttpService fallbackService = sourceRequestResponse != null && sourceRequestResponse.request() != null
+                ? sourceRequestResponse.request().httpService()
+                : null;
         for (int i = 0; i < cap; i++) {
             String rawRequest = requests.get(i);
             try {
                 HttpRequest req = HttpRequest.httpRequest(rawRequest);
+                if ((req.httpService() == null || req.httpService().host() == null || req.httpService().host().isEmpty())
+                        && fallbackService != null) {
+                    req = HttpRequest.httpRequest(fallbackService, rawRequest);
+                }
                 HttpRequestResponse rr = api.http().sendRequest(req);
                 int status = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
                 lines.add(String.format("- Request %d: sent, HTTP %s.", i + 1, status >= 0 ? Integer.toString(status) : "no response"));
@@ -3320,9 +3372,8 @@ private void createMainTab() {
 
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json");
-        conn.setConnectTimeout(15000); //reduced from 30000
-        conn.setReadTimeout(360000); //incresed from 60000 for local LLM
-        //log("DEBUG -S2- conn.setReadTimeout", LogCategory.GENERAL);
+        conn.setConnectTimeout(AI_CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout("local".equals(provider) ? AI_READ_TIMEOUT_LOCAL_MS : AI_READ_TIMEOUT_CLOUD_MS);
 
         switch (provider) {
             case "claude":
@@ -4740,7 +4791,7 @@ public AuditResult passiveAudit(HttpRequestResponse baseRequestResponse) {
 
 @Override
 public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue existingIssue) {
-    if (isExtensionGeneratedIssue(newIssue) && isExtensionGeneratedIssue(existingIssue)) {
+    if (isExtensionGeneratedIssue(newIssue)) {
         String newName = newIssue.name() != null ? newIssue.name() : "";
         String existingName = existingIssue.name() != null ? existingIssue.name() : "";
         String newBase = newIssue.baseUrl() != null ? newIssue.baseUrl() : "";
