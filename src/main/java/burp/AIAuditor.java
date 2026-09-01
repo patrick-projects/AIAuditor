@@ -41,6 +41,17 @@
  * - ADDED: RightClick > Explain me this is added. Vulnrabilities will be added as Inforamtion items to read. Custom & dedicated prompt is also provided for user inputs
  * - ADDED: Multiple Gemini API keys can be added and they will be rotated when rate limits triggered. Good for using free api keys to try out the plugins
  * - MODIFIED: When the custom prompt dont have format related instructions, model will add them dynamically in the prompt so the findings will be added to burp.
+ *
+ * Version: 1.2
+ *
+ * CHANGELOG: August 31, 2026
+ * - ADDED: Chat tab to prompt the local LLM from inside Burp (Ctrl/Cmd+Enter). Falls back to Premium Model for PoCs if no Local LLM URL is set. Right-click Send to Chat attaches HTTP or issue context.
+ *
+ * Version: 1.3
+ *
+ * CHANGELOG: September 1, 2026
+ * - MODIFIED: Suite UI — no nested scroll, no always-on how-to banner, Save on a footer, Automation tab (was Cheap local bulk), collapsed setup guide, theme-aware logs, dead business-logic drawer removed.
+ * - ADDED: Chat Checks buttons (Email forms, Secrets, Auth, IDOR, XSS, Hidden APIs) that hunt the Site Map with Include Burp traffic on.
  */
 
 package burp;
@@ -110,6 +121,9 @@ import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPoint;
 import burp.api.montoya.scanner.audit.issues.AuditIssue;
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence;
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
+import burp.api.montoya.http.message.params.ParsedHttpParameter;
+import burp.api.montoya.proxy.ProxyHttpRequestResponse;
+import burp.api.montoya.sitemap.SiteMapFilter;
 import burp.api.montoya.ui.Selection;
 import burp.api.montoya.ui.contextmenu.*;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
@@ -145,6 +159,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private static final int DEFAULT_PASSIVE_MAX_BODY_KB = 256;
     /** Cap auto-executed PoC requests extracted from model output. */
     private static final int MAX_AUTO_POC_REQUESTS = 8;
+    /** Per-response body excerpt included in auto-execution and verification prompts. */
+    private static final int POC_RESPONSE_BODY_PREVIEW_CHARS = 12_000;
+    /** Total cap for all response excerpts sent to the PoC verification LLM call. */
+    private static final int POC_VERIFY_TOTAL_RESPONSE_CHARS = 48_000;
     /**
      * PoC/investigation prompts are not chunked; cap evidence to avoid single-request provider hard-limit failures.
      * Uses a soft target tied to maxChunkSize and a hard ceiling for safety.
@@ -243,11 +261,100 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 	 private JLabel completedTasksLabel;
     /** Rolling log on the Dashboard tab (PoC, manual audits, passive hooks). */
     private JTextArea dashboardActivityArea;
-    /** Optional collapsible pane for business-logic testing suggestions. */
-    private JTextArea dashboardBusinessLogicArea;
-    private JPanel dashboardBusinessLogicContentPanel;
-    private JButton dashboardBusinessLogicToggleButton;
     private static final int DASHBOARD_ACTIVITY_MAX_LINES = 400;
+
+    /** Suite tab strip so Chat can be focused after a context-menu attach. */
+    private JTabbedPane suiteTabs;
+    private JTextArea chatHistoryArea;
+    private JTextArea chatInputArea;
+    private JButton chatSendButton;
+    private JLabel chatStatusLabel;
+    private JLabel chatAttachmentLabel;
+    private JCheckBox chatIncludeHttpCheckbox;
+    private final List<JButton> chatCheckButtons = new ArrayList<>();
+    private volatile HttpRequestResponse chatAttachedHttp;
+    private volatile String chatAttachedExtra;
+    private final List<ChatTurn> chatTurns = new ArrayList<>();
+    private volatile boolean chatBusy = false;
+    private static final int CHAT_PROMPT_MAX_CHARS = 120_000;
+    private static final int CHAT_HISTORY_MAX_TURNS = 24;
+    private static final int CHAT_HISTORY_SCAN_MAX_ITEMS = 400;
+    private static final int CHAT_SITEMAP_BODY_SCAN_MAX = 80;
+    private static final int CHAT_QUERY_MATCH_LIST_MAX = 250;
+    private static final int CHAT_DIGEST_MAX_CHARS = 60_000;
+    private static final int CHAT_HTML_SCAN_CHARS = 80_000;
+    private static final int CHAT_MAX_BODY_BYTES = 256 * 1024;
+    private static final long CHAT_SCAN_BUDGET_MS = 8000L;
+    private static final Set<String> CHAT_STOPWORDS = Set.of(
+            "please", "look", "looking", "find", "search", "scan", "for", "the", "and", "that", "this",
+            "with", "from", "have", "there", "their", "what", "when", "where", "which", "would",
+            "could", "should", "about", "into", "over", "just", "like", "want", "need", "does",
+            "sitemap", "site", "map", "burp", "chat", "traffic", "history", "proxy", "request",
+            "response", "http", "https", "something", "specific", "related", "not", "all", "can",
+            "you", "our", "plugin", "well", "huge", "items", "item", "also", "any", "are", "was",
+            "were", "been", "being", "them", "then", "than", "some", "more", "most", "only",
+            "through", "using", "use", "used", "see", "show", "tell", "give", "get", "got");
+    private static final String[][] CHAT_VULN_CHECKS = {
+            {"Email forms",
+                    "Search the Site Map and JavaScript for non-authentication forms that collect email "
+                            + "(newsletter, contact, marketing, support — not login, register, or forgot-password). "
+                            + "List method, URL, and field names from evidence only. Say if none."},
+            {"Secrets",
+                    "Search JavaScript, HTML, and JSON in the Site Map for leaked secrets: API keys, JWTs, tokens, "
+                            + "passwords, cloud credentials, private URLs. Quote the file URL and a short redacted snippet. "
+                            + "Skip likely false positives."},
+            {"Auth",
+                    "Find authentication and session surfaces: login, register, password reset, OAuth, SSO, logout, cookies. "
+                            + "Note anything unusual in evidence (verb tampering, missing CSRF, username enumeration, "
+                            + "unverified identity-change flows). List method and URL."},
+            {"IDOR",
+                    "Find endpoints whose URLs or parameters look like object IDs (user, account, order, uuid, numeric id). "
+                            + "List IDOR/BOLA candidates with method and URL. Do not invent IDs that are not in evidence."},
+            {"XSS",
+                    "Find reflected-input surfaces: search, q, query, redirect, next, callback, template, message. "
+                            + "List method, URL, and parameter names worth XSS testing. Note sinks visible in JavaScript."},
+            {"Hidden APIs",
+                    "Find non-obvious APIs and debug surfaces: graphql, swagger, openapi, /api/, admin, actuator, "
+                            + "source maps, env, backup, .json. List method and URL from the Site Map."}
+    };
+    private static final Pattern HTML_FORM_PATTERN = Pattern.compile("(?is)<form\\b[^>]*>.*?</form>");
+    private static final Pattern HTML_EMAIL_INPUT_PATTERN = Pattern.compile(
+            "(?is)<input\\b[^>]*(?:type\\s*=\\s*['\"]email['\"]|name\\s*=\\s*['\"][^'\"]*e-?mail[^'\"]*['\"])[^>]*>");
+    private static final Pattern FORM_ACTION_PATTERN = Pattern.compile("(?is)\\baction\\s*=\\s*['\"]([^'\"]*)['\"]");
+    private static final Pattern FORM_METHOD_PATTERN = Pattern.compile("(?is)\\bmethod\\s*=\\s*['\"]([^'\"]*)['\"]");
+    private static final Pattern INPUT_NAME_PATTERN = Pattern.compile("(?is)\\bname\\s*=\\s*['\"]([^'\"]+)['\"]");
+    private static final Pattern JS_TYPE_EMAIL_PATTERN = Pattern.compile("type\\s*[:=]\\s*['\"]email['\"]", Pattern.CASE_INSENSITIVE);
+    private static final Pattern JS_NAME_EMAIL_PATTERN = Pattern.compile(
+            "(?:name|id|placeholder)\\s*[:=]\\s*['\"][^'\"]*e-?mail[^'\"]*['\"]", Pattern.CASE_INSENSITIVE);
+    private static final Pattern JS_EMAIL_KEY_PATTERN = Pattern.compile("['\"]e-?mail['\"]\\s*:", Pattern.CASE_INSENSITIVE);
+    private static final Pattern JS_APPEND_EMAIL_PATTERN = Pattern.compile(
+            "(?:append|set)\\s*\\(\\s*['\"][^'\"]*e-?mail[^'\"]*['\"]", Pattern.CASE_INSENSITIVE);
+    private static final Pattern JS_CONTACT_URL_PATTERN = Pattern.compile(
+            "['\"](/[^'\"\\s]{0,120}(?:newsletter|subscribe|contact[-_]?us|mailing-list|mailchimp|klaviyo)[^'\"\\s]{0,80})['\"]",
+            Pattern.CASE_INSENSITIVE);
+
+    private static final class ChatTurn {
+        final String role;
+        final String text;
+
+        ChatTurn(String role, String text) {
+            this.role = role;
+            this.text = text;
+        }
+    }
+
+    private static final class EmailTrafficAcc {
+        final LinkedHashSet<String> nonAuth = new LinkedHashSet<>();
+        final LinkedHashSet<String> authRelated = new LinkedHashSet<>();
+        final LinkedHashSet<String> htmlNoEmail = new LinkedHashSet<>();
+        final LinkedHashSet<String> jsScanned = new LinkedHashSet<>();
+        final LinkedHashSet<String> queryMatches = new LinkedHashSet<>();
+        final LinkedHashSet<String> termSnippets = new LinkedHashSet<>();
+        int jsFiles;
+        int siteMapItems;
+        int siteMapInScope;
+        int bodyDeepScans;
+    }
 	 private AtomicInteger completedTasksCounter = new AtomicInteger(0);
 
 
@@ -272,6 +379,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private String cachedDefaultOpenrouter = "openrouter/mistralai/mistral-7b-instruct";
     private String cachedDefaultXai = "xai/grok-4-1-fast-non-reasoning";
     private String cachedDefaultLocal = "local/gemma4:e4b";
+    /** Last {@code id} values from local {@code GET /v1/models} (empty until Validate / Get Latest Models). */
+    private volatile List<String> cachedLocalModelIdsFromServer = new ArrayList<>();
 
     private JCheckBox passiveAiOnScannerIssuesCheckbox;
     private JCheckBox passiveAiAllTrafficCheckbox;
@@ -291,6 +400,10 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     private volatile int passiveMaxResponseBytes = DEFAULT_PASSIVE_MAX_BODY_KB * 1024;
     private final Set<String> passiveAuditDedupKeys = ConcurrentHashMap.newKeySet();
     private final Set<String> proxyBrowserAiDedupKeys = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger proxyAiWindowCount = new AtomicInteger();
+    private volatile long proxyAiWindowStartMs = 0L;
+    private static final int PROXY_AI_MAX_PER_WINDOW = 3;
+    private static final long PROXY_AI_WINDOW_MS = 2500L;
     private final Map<String, ActiveHostRequestBudget> activeHostRequestBudgets = new ConcurrentHashMap<>();
     private volatile long lastActiveNullServiceLogMs = 0L;
 
@@ -610,49 +723,108 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
     }
 
 private void createMainTab() {
-        mainPanel = new JPanel(new BorderLayout(8, 8));
+        mainPanel = new JPanel(new BorderLayout(0, 0));
 
-        JTextArea quickStart = new JTextArea(
-                "Dashboard tab shows live task queue + activity for PoCs, manual scans, and automated audits.\n\n"
-                + "• Connect: Set up API keys and choose models (Premium for PoCs)\n"
-                + "• Cheap local bulk: Configure when to run automatic/background work\n"
-                + "• Prompts: Customize instructions (optional)\n"
-                + "• Tuning: Advanced settings, rate limits, and logging level",
-                5, 68);
-        quickStart.setEditable(false);
-        quickStart.setLineWrap(true);
-        quickStart.setWrapStyleWord(true);
-        quickStart.setOpaque(false);
-        quickStart.setBorder(BorderFactory.createEmptyBorder(4, 8, 8, 8));
-        JPanel tipWrap = new JPanel(new BorderLayout());
-        tipWrap.add(quickStart, BorderLayout.CENTER);
-        tipWrap.setBorder(BorderFactory.createTitledBorder("How to use this screen"));
+        suiteTabs = new JTabbedPane();
+        suiteTabs.addTab("Dashboard", buildDashboardPanel());
+        suiteTabs.addTab("Chat", buildChatPanel());
+        suiteTabs.addTab("Connect", wrapTabScroll(buildSetupProvidersPanel()));
+        suiteTabs.addTab("Automation", wrapTabScroll(buildAutomationDefaultsPanel()));
+        suiteTabs.addTab("Prompts", wrapTabScroll(buildPromptsPanel()));
+        suiteTabs.addTab("Tuning", wrapTabScroll(buildAdvancedStatusPanel()));
+        suiteTabs.setToolTipTextAt(0, "Live queue and activity for scans, PoCs, and Chat.");
+        suiteTabs.setToolTipTextAt(1, "Ask the local LLM about captured traffic. Ctrl/Cmd+Enter to send.");
+        suiteTabs.setToolTipTextAt(2, "API keys, local LLM URL, and model selection.");
+        suiteTabs.setToolTipTextAt(3, "When to run the cheap/local bulk model automatically.");
+        suiteTabs.setToolTipTextAt(4, "Scan, Explain, and PoC prompt text.");
+        suiteTabs.setToolTipTextAt(5, "Retries, rate limits, batch size, and logging.");
 
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.setBorder(BorderFactory.createEmptyBorder(0, 4, 4, 4));
-        tabs.addTab("Dashboard", wrapTabScroll(buildDashboardPanel()));
-        tabs.addTab("Connect", wrapTabScroll(buildSetupProvidersPanel()));
-        tabs.addTab("Cheap local bulk", wrapTabScroll(buildAutomationDefaultsPanel()));
-        tabs.addTab("Prompts", wrapTabScroll(buildPromptsPanel()));
-        tabs.addTab("Tuning", wrapTabScroll(buildAdvancedStatusPanel()));
+        JPanel footer = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        footer.setBorder(BorderFactory.createEmptyBorder(2, 6, 6, 6));
+        saveButton = new JButton("Save Settings");
+        saveButton.setToolTipText("Saves keys, models, prompts, automation, and tuning.");
+        saveButton.addActionListener(e -> saveSettings());
+        footer.add(saveButton);
+        JLabel saveHint = new JLabel("Connect · Automation · Prompts · Tuning");
+        Color muted = UIManager.getColor("Label.disabledForeground");
+        if (muted != null) {
+            saveHint.setForeground(muted);
+        }
+        footer.add(saveHint);
+        footer.setVisible(false);
+        suiteTabs.addChangeListener(e -> {
+            int i = suiteTabs.getSelectedIndex();
+            footer.setVisible(i >= 2);
+        });
 
-        mainPanel.add(tipWrap, BorderLayout.NORTH);
-        mainPanel.add(tabs, BorderLayout.CENTER);
-
-        JScrollPane outerScroll = new JScrollPane(mainPanel);
-        outerScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
-        outerScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        mainPanel.add(suiteTabs, BorderLayout.CENTER);
+        mainPanel.add(footer, BorderLayout.SOUTH);
 
         new javax.swing.Timer(1000, e -> updateStatusPanel()).start();
 
-        api.userInterface().registerSuiteTab("AI Auditor", outerScroll);
+        api.userInterface().registerSuiteTab("AI Auditor", mainPanel);
     }
 
     private JScrollPane wrapTabScroll(JPanel content) {
         JScrollPane sp = new JScrollPane(content);
         sp.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
         sp.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        sp.getVerticalScrollBar().setUnitIncrement(16);
         return sp;
+    }
+
+    private JTextArea hintArea(String text, int rows) {
+        JTextArea area = new JTextArea(text, rows, 40);
+        area.setEditable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setOpaque(false);
+        area.setBorder(null);
+        Color muted = UIManager.getColor("Label.disabledForeground");
+        if (muted != null) {
+            area.setForeground(muted);
+        }
+        return area;
+    }
+
+    private void styleLogArea(JTextArea area, boolean wrapWords) {
+        area.setEditable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(wrapWords);
+        area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        Color bg = UIManager.getColor("TextArea.background");
+        Color fg = UIManager.getColor("TextArea.foreground");
+        if (bg != null) {
+            area.setBackground(bg);
+        }
+        if (fg != null) {
+            area.setForeground(fg);
+            area.setCaretColor(fg);
+        }
+    }
+
+    private JPanel collapsibleSection(String title, JComponent body, boolean startOpen) {
+        JPanel wrap = new JPanel(new BorderLayout(0, 4));
+        JButton toggle = new JButton();
+        toggle.setFocusPainted(false);
+        toggle.setHorizontalAlignment(SwingConstants.LEFT);
+        body.setVisible(startOpen);
+        toggle.setText((startOpen ? "▼ " : "▶ ") + title);
+        toggle.addActionListener(e -> {
+            boolean open = !body.isVisible();
+            body.setVisible(open);
+            toggle.setText((open ? "▼ " : "▶ ") + title);
+            wrap.revalidate();
+            wrap.repaint();
+            Container parent = wrap.getParent();
+            if (parent != null) {
+                parent.revalidate();
+                parent.repaint();
+            }
+        });
+        wrap.add(toggle, BorderLayout.NORTH);
+        wrap.add(body, BorderLayout.CENTER);
+        return wrap;
     }
 
     private void addGridBagFiller(JPanel panel, GridBagConstraints gbc, int row) {
@@ -678,7 +850,10 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel connectHint = new JLabel("Add one cloud key or a local LLM URL, click Validate, then under Models pick automatic/bulk and premium models and set Local LLM model id when using local/… — Get Latest Models and Save.");
+        JTextArea connectHint = hintArea(
+                "Add a cloud API key or a Local LLM URL, click Validate, pick automatic/bulk and premium models, "
+                        + "set Local LLM model id for local/…, then Save.",
+                2);
         rgbc.gridy = 0;
         root.add(connectHint, rgbc);
 
@@ -700,7 +875,7 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.weightx = 0;
         cred.add(new JLabel("Google API Keys (one per line):"), gbc);
-        geminiKeyField = new JTextArea(5, 40);
+        geminiKeyField = new JTextArea(3, 40);
         geminiKeyField.setLineWrap(true);
         geminiKeyField.setWrapStyleWord(true);
         JScrollPane geminiKeyScrollPane = new JScrollPane(geminiKeyField);
@@ -848,17 +1023,9 @@ private void createMainTab() {
         rgbc.gridy = 3;
         root.add(models, rgbc);
 
-        saveButton = new JButton("Save Settings");
-        saveButton.setToolTipText("Saves keys, models, prompts, and all other tabs.");
-        saveButton.addActionListener(e -> saveSettings());
-        JPanel saveWrap = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        saveWrap.add(saveButton);
-        rgbc.gridy = 4;
-        root.add(saveWrap, rgbc);
-
         GridBagConstraints filler = new GridBagConstraints();
         filler.gridx = 0;
-        filler.gridy = 5;
+        filler.gridy = 4;
         filler.weighty = 1.0;
         filler.weightx = 1.0;
         filler.fill = GridBagConstraints.BOTH;
@@ -876,8 +1043,10 @@ private void createMainTab() {
         rgbc.weightx = 1.0;
         rgbc.gridwidth = GridBagConstraints.REMAINDER;
 
-        JLabel bgHint = new JLabel("This tab is for high-volume automation: on Connect → Models, pick the automatic/bulk model and Local LLM model id (LM Studio / Ollama). "
-                + "Premium cloud APIs as bulk can rack up large bills. Manual Premium PoC is for right-click / Explain / PoC only — not these checkboxes.");
+        JTextArea bgHint = hintArea(
+                "High-volume automatic audits. On Connect, pick the automatic/bulk model (prefer local/…) and Local LLM model id. "
+                        + "Premium PoC is for right-click / Explain only — not these checkboxes.",
+                2);
         rgbc.gridy = 0;
         root.add(bgHint, rgbc);
 
@@ -891,20 +1060,21 @@ private void createMainTab() {
         gbc.gridx = 0;
         int row = 0;
 
-        passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Scanner reports an issue, queue a bulk-model review (recommended)");
+        passiveAiOnScannerIssuesCheckbox = new JCheckBox("After Scanner issues, queue a bulk-model review");
         passiveAiOnScannerIssuesCheckbox.setSelected(passiveAiOnScannerIssues);
         passiveAiOnScannerIssuesCheckbox.setToolTipText("Uses the Connect automatic/bulk model only. Prefer local or a small cloud model — each Scanner issue can trigger another API call.");
-        passiveAiAllTrafficCheckbox = new JCheckBox("Broad passive-scan traffic: bulk model (not Proxy-only; costly if cloud)");
+        passiveAiAllTrafficCheckbox = new JCheckBox("All passively scanned HTTP (high volume; not Proxy-only)");
         passiveAiAllTrafficCheckbox.setSelected(passiveAiAuditAllTraffic);
         passiveAiAllTrafficCheckbox.setToolTipText("Burp passive Scan check: runs the automatic/bulk model on most HTTP Burp passively analyzes (sitemap / crawl scale — high volume). "
                 + "This is not limited to traffic through the Proxy tool. Prefer local or a cheap cloud bulk model.");
-        proxyBrowserLocalAiCheckbox = new JCheckBox("Proxied traffic only (Proxy ± Repeater): bulk model (local bulk + URL)");
+        proxyBrowserLocalAiCheckbox = new JCheckBox("Proxied traffic only (Proxy ± Repeater)");
         proxyBrowserLocalAiCheckbox.setSelected(proxyBrowserLocalAiEnabled);
-        proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP);
-        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater with proxied-only bulk audits");
+        proxyBrowserLocalAiCheckbox.setToolTipText(PROXY_BROWSER_LOCAL_AI_TOOLTIP
+                + " Skips JavaScript/CSS. Rate-limited so a busy site cannot freeze Burp.");
+        proxyIncludeRepeaterCheckbox = new JCheckBox("Include Repeater with proxied-only audits");
         proxyIncludeRepeaterCheckbox.setSelected(proxyIncludeRepeater);
         proxyIncludeRepeaterCheckbox.setToolTipText("When enabled, Repeater responses use the same proxied-only bulk path and local/… + URL rules as the Proxy checkbox above.");
-        passiveAiInScopeCheckbox = new JCheckBox("Only in-scope URLs (applies to all automatic paths above)");
+        passiveAiInScopeCheckbox = new JCheckBox("In-scope URLs only");
         passiveAiInScopeCheckbox.setSelected(passiveAiInScopeOnly);
 
         gbc.gridy = row++;
@@ -947,15 +1117,16 @@ private void createMainTab() {
         rgbc.gridy = 1;
         root.add(autoBox, rgbc);
 
-        JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 18, 52);
+        JTextArea proxySetupGuideArea = new JTextArea(LOCAL_LM_STUDIO_SETUP_TEXT, 12, 52);
         proxySetupGuideArea.setEditable(false);
         proxySetupGuideArea.setLineWrap(true);
         proxySetupGuideArea.setWrapStyleWord(true);
         proxySetupGuideArea.setBackground(UIManager.getColor("Panel.background"));
-        proxySetupGuideArea.setBorder(BorderFactory.createTitledBorder("Local LLM — Ollama (terminal) or LM Studio"));
         proxySetupGuideArea.setToolTipText("Ollama: gemma4:e4b by default; gemma4:26b if you have the RAM. Or use LM Studio steps below.");
+        JScrollPane guideScroll = new JScrollPane(proxySetupGuideArea);
+        guideScroll.setPreferredSize(new Dimension(520, 180));
         rgbc.gridy = 2;
-        root.add(new JScrollPane(proxySetupGuideArea), rgbc);
+        root.add(collapsibleSection("Local LLM setup (Ollama or LM Studio)", guideScroll, false), rgbc);
 
         JPanel limits = new JPanel(new GridBagLayout());
         limits.setBorder(BorderFactory.createTitledBorder("Limits, proxy, and cloud \"Default\" model IDs"));
@@ -1056,8 +1227,8 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        panel.add(new JLabel("The main prompt is pre-filled with the default scan instructions (same text the extension used when this box was empty). "
-                + "Edit freely. Template buttons copy individual sections to the clipboard if you want to merge or replace parts."), gbc);
+        panel.add(hintArea("The main prompt is pre-filled with the default scan instructions. "
+                + "Edit freely. Template buttons copy individual sections to the clipboard.", 2), gbc);
 
         gbc.gridy = ++row;
         panel.add(new JLabel("Main prompt (most scans use this)"), gbc);
@@ -1068,16 +1239,6 @@ private void createMainTab() {
         promptTemplateArea.setWrapStyleWord(true);
         promptTemplateArea.setText(getDefaultPromptTemplate());
         panel.add(new JScrollPane(promptTemplateArea), gbc);
-
-        gbc.gridy = ++row;
-        gbc.fill = GridBagConstraints.NONE;
-        JButton savePromptsTab = new JButton("Save Settings");
-        savePromptsTab.setToolTipText("Saves everything (all tabs), not only prompts.");
-        savePromptsTab.addActionListener(e -> saveSettings());
-        JPanel saveRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        saveRow.add(savePromptsTab);
-        panel.add(saveRow, gbc);
-        gbc.fill = GridBagConstraints.HORIZONTAL;
 
         gbc.gridy = ++row;
         JPanel templateButtonsPanel = createTemplateButtonsPanel();
@@ -1117,8 +1278,7 @@ private void createMainTab() {
         gbc.gridy = row;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
-        panel.add(new JLabel("Optional. Open this if requests fail, hit rate limits, or logs are too noisy. "
-                + "Otherwise you can ignore it."), gbc);
+        panel.add(hintArea("Optional. Open this if requests fail, hit rate limits, or logs are too noisy.", 1), gbc);
         gbc.gridwidth = 1;
 
         gbc.gridx = 0;
@@ -1196,7 +1356,7 @@ private void createMainTab() {
 
         JPanel loggingPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         detailedLoggingRadio = new JRadioButton("Detailed logging");
-        detailedOnelinerLoggingRadio = new JRadioButton("Detailed logging oneliner");
+        detailedOnelinerLoggingRadio = new JRadioButton("Detailed (one line)");
         limitedLoggingRadio = new JRadioButton("Limited logging");
         loggingButtonGroup = new ButtonGroup();
         loggingButtonGroup.add(detailedLoggingRadio);
@@ -1225,147 +1385,1155 @@ private void createMainTab() {
     }
 
     /**
-     * Task queue + activity feed. Burp Suite’s top-level Dashboard tab cannot host extension UI; this tab is the
-     * in-extension equivalent for AI Auditor work alongside other scans.
+     * Task queue + activity feed for AI Auditor work.
      */
     private JPanel buildDashboardPanel() {
-        JPanel panel = new JPanel(new GridBagLayout());
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(8, 8, 8, 8);
-        gbc.fill = GridBagConstraints.HORIZONTAL;
-        gbc.gridx = 0;
-        gbc.gridy = 0;
-        gbc.weightx = 1.0;
-        gbc.gridwidth = GridBagConstraints.REMAINDER;
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
-        JLabel header = new JLabel("AI Auditor Dashboard — Live task queue and activity feed");
-        header.setFont(header.getFont().deriveFont(Font.BOLD, 14f));
-        panel.add(header, gbc);
-
-        JLabel subheader = new JLabel("Burp's built-in Dashboard cannot host extension panels. "
-                + "This is the dedicated live view for all AI Auditor activity.");
-        subheader.setFont(subheader.getFont().deriveFont(Font.PLAIN, 12f));
-        subheader.setForeground(new Color(100, 100, 100));
-        gbc.gridy = 1;
-        gbc.insets = new Insets(2, 8, 12, 8);
-        panel.add(subheader, gbc);
-
-        // Status panel - task counters
-        JPanel statusPanel = new JPanel(new GridLayout(3, 1, 0, 4));
-        statusPanel.setBorder(BorderFactory.createTitledBorder("Task Queue"));
-        activeTasksLabel = new JLabel("Active Tasks: 0");
-        queuedTasksLabel = new JLabel("Queued Tasks: 0");
-        completedTasksLabel = new JLabel("Completed Tasks: 0");
-
-        // Style the labels for better readability
+        JPanel statusPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 24, 4));
+        statusPanel.setBorder(BorderFactory.createTitledBorder("Queue"));
+        activeTasksLabel = new JLabel("Active: 0");
+        queuedTasksLabel = new JLabel("Queued: 0");
+        completedTasksLabel = new JLabel("Completed: 0");
         for (JLabel label : new JLabel[]{activeTasksLabel, queuedTasksLabel, completedTasksLabel}) {
             label.setFont(label.getFont().deriveFont(Font.BOLD, 13f));
+            statusPanel.add(label);
         }
 
-        statusPanel.add(activeTasksLabel);
-        statusPanel.add(queuedTasksLabel);
-        statusPanel.add(completedTasksLabel);
-
-        gbc.gridy = 2;
-        gbc.weighty = 0;
-        gbc.insets = new Insets(8, 8, 8, 8);
-        panel.add(statusPanel, gbc);
-
-        // Activity log
-        gbc.gridy = 3;
-        gbc.insets = new Insets(12, 8, 4, 8);
-        JLabel activityLabel = new JLabel("Recent Activity — PoC runs, manual scans, passive/Scanner-triggered audits");
-        activityLabel.setFont(activityLabel.getFont().deriveFont(Font.BOLD, 12f));
-        panel.add(activityLabel, gbc);
-
         dashboardActivityArea = new JTextArea(18, 70);
-        dashboardActivityArea.setEditable(false);
-        dashboardActivityArea.setLineWrap(true);
-        dashboardActivityArea.setWrapStyleWord(false); // Better for log lines
-        dashboardActivityArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        dashboardActivityArea.setBackground(new Color(28, 31, 37)); // Dark log background
-        dashboardActivityArea.setForeground(new Color(220, 225, 230)); // Light text for readability
-        dashboardActivityArea.setCaretColor(new Color(220, 225, 230));
-        dashboardActivityArea.setSelectionColor(new Color(60, 76, 107));
-        dashboardActivityArea.setSelectedTextColor(Color.WHITE);
-        dashboardActivityArea.setText("Dashboard ready. Activity will appear here as you run PoCs and scans.\n");
-
-        gbc.gridy = 4;
-        gbc.fill = GridBagConstraints.BOTH;
-        gbc.weighty = 1.0;
-        gbc.insets = new Insets(4, 8, 8, 8);
+        styleLogArea(dashboardActivityArea, false);
+        dashboardActivityArea.setText("Ready. Activity appears here as you run scans, PoCs, and Chat.\n");
         JScrollPane activityScroll = new JScrollPane(dashboardActivityArea);
-        activityScroll.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createTitledBorder("Activity Log"),
-                BorderFactory.createEmptyBorder(4, 4, 4, 4)
-        ));
-        panel.add(activityScroll, gbc);
+        activityScroll.setBorder(BorderFactory.createTitledBorder("Activity"));
 
-        // Control buttons
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        JButton clearActivity = new JButton("Clear Log");
+        JButton clearActivity = new JButton("Clear");
         clearActivity.addActionListener(e -> {
-            dashboardActivityArea.setText("Dashboard ready. Activity will appear here as you run PoCs and scans.\n");
+            dashboardActivityArea.setText("Ready. Activity appears here as you run scans, PoCs, and Chat.\n");
         });
-        JButton copyLog = new JButton("Copy Log");
+        JButton copyLog = new JButton("Copy");
         copyLog.addActionListener(e -> copyActivityLogToClipboard());
-
         controls.add(clearActivity);
         controls.add(copyLog);
 
-        gbc.gridy = 5;
-        gbc.fill = GridBagConstraints.HORIZONTAL;
-        gbc.weighty = 0;
-        gbc.insets = new Insets(4, 8, 8, 8);
-        panel.add(controls, gbc);
-
-        // Collapsible drawer to keep optional analysis out of the main dashboard flow.
-        gbc.gridy = 6;
-        gbc.fill = GridBagConstraints.HORIZONTAL;
-        gbc.weighty = 0;
-        gbc.insets = new Insets(0, 8, 8, 8);
-        panel.add(buildDashboardBusinessLogicDrawer(panel), gbc);
-
+        panel.add(statusPanel, BorderLayout.NORTH);
+        panel.add(activityScroll, BorderLayout.CENTER);
+        panel.add(controls, BorderLayout.SOUTH);
         return panel;
     }
 
-    private JPanel buildDashboardBusinessLogicDrawer(JPanel dashboardRoot) {
-        JPanel wrap = new JPanel(new BorderLayout(0, 6));
-        wrap.setBorder(BorderFactory.createTitledBorder("Optional analysis"));
+    private JPanel buildChatPanel() {
+        JPanel root = new JPanel(new BorderLayout(4, 4));
+        root.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
 
-        dashboardBusinessLogicToggleButton = new JButton("▶ Business logic suggestions (Local LLM)");
-        dashboardBusinessLogicToggleButton.setFocusPainted(false);
-        dashboardBusinessLogicToggleButton.setHorizontalAlignment(SwingConstants.LEFT);
-        wrap.add(dashboardBusinessLogicToggleButton, BorderLayout.NORTH);
+        JPanel north = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(0, 2, 2, 2);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridy = 0;
 
-        dashboardBusinessLogicArea = new JTextArea(8, 70);
-        dashboardBusinessLogicArea.setEditable(false);
-        dashboardBusinessLogicArea.setLineWrap(true);
-        dashboardBusinessLogicArea.setWrapStyleWord(true);
-        dashboardBusinessLogicArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        dashboardBusinessLogicArea.setBackground(new Color(28, 31, 37));
-        dashboardBusinessLogicArea.setForeground(new Color(220, 225, 230));
-        dashboardBusinessLogicArea.setCaretColor(new Color(220, 225, 230));
-        dashboardBusinessLogicArea.setSelectionColor(new Color(60, 76, 107));
-        dashboardBusinessLogicArea.setSelectedTextColor(Color.WHITE);
-        dashboardBusinessLogicArea.setText("Suggestions are hidden by default to keep this dashboard clean.\n"
-                + "When enabled, this panel will show local-LLM hypotheses for business-logic tests.");
+        JLabel header = new JLabel("Ctrl/Cmd+Enter to send");
+        header.setFont(header.getFont().deriveFont(Font.BOLD, 13f));
+        gbc.gridx = 0;
+        gbc.weightx = 0;
+        north.add(header, gbc);
 
-        dashboardBusinessLogicContentPanel = new JPanel(new BorderLayout(0, 6));
-        dashboardBusinessLogicContentPanel.add(new JScrollPane(dashboardBusinessLogicArea), BorderLayout.CENTER);
-        dashboardBusinessLogicContentPanel.setVisible(false);
-        wrap.add(dashboardBusinessLogicContentPanel, BorderLayout.CENTER);
+        chatStatusLabel = new JLabel("Ready — local LLM");
+        Color muted = UIManager.getColor("Label.disabledForeground");
+        if (muted != null) {
+            chatStatusLabel.setForeground(muted);
+        }
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        north.add(chatStatusLabel, gbc);
 
-        dashboardBusinessLogicToggleButton.addActionListener(e -> {
-            boolean expand = !dashboardBusinessLogicContentPanel.isVisible();
-            dashboardBusinessLogicContentPanel.setVisible(expand);
-            dashboardBusinessLogicToggleButton.setText(
-                    (expand ? "▼ " : "▶ ") + "Business logic suggestions (Local LLM)");
-            dashboardRoot.revalidate();
-            dashboardRoot.repaint();
+        chatIncludeHttpCheckbox = new JCheckBox("Include Burp traffic", true);
+        chatIncludeHttpCheckbox.setToolTipText("Adds a digest of Proxy history and Site Map, plus any Send-to-Chat attachment. Leave on so Chat can search captured traffic instead of giving generic advice.");
+        gbc.gridx = 0;
+        gbc.gridy = 1;
+        gbc.weightx = 0;
+        north.add(chatIncludeHttpCheckbox, gbc);
+
+        chatAttachmentLabel = new JLabel("No HTTP attached.");
+        if (muted != null) {
+            chatAttachmentLabel.setForeground(muted);
+        }
+        gbc.gridx = 1;
+        gbc.weightx = 1.0;
+        north.add(chatAttachmentLabel, gbc);
+
+        root.add(north, BorderLayout.NORTH);
+
+        chatHistoryArea = new JTextArea(8, 70);
+        styleLogArea(chatHistoryArea, true);
+        refreshChatHistoryView();
+        JScrollPane historyScroll = new JScrollPane(chatHistoryArea);
+        historyScroll.setBorder(BorderFactory.createTitledBorder("Conversation"));
+        root.add(historyScroll, BorderLayout.CENTER);
+
+        JPanel south = new JPanel(new BorderLayout(4, 4));
+        south.add(buildChatCheckBar(), BorderLayout.NORTH);
+
+        chatInputArea = new JTextArea(2, 50);
+        chatInputArea.setLineWrap(true);
+        chatInputArea.setWrapStyleWord(true);
+        chatInputArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        chatInputArea.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_ENTER && (e.isControlDown() || e.isMetaDown())) {
+                    e.consume();
+                    sendChatPrompt();
+                }
+            }
         });
+        JScrollPane inputScroll = new JScrollPane(chatInputArea);
+        inputScroll.setBorder(BorderFactory.createTitledBorder("Prompt"));
 
+        JPanel buttons = new JPanel(new GridLayout(3, 1, 0, 4));
+        chatSendButton = new JButton("Send");
+        chatSendButton.setToolTipText("Send to the local LLM (Ctrl/Cmd+Enter). Falls back to Premium Model for PoCs if no local URL is set.");
+        chatSendButton.addActionListener(e -> sendChatPrompt());
+        JButton clearChat = new JButton("Clear");
+        clearChat.setToolTipText("Clear conversation");
+        clearChat.addActionListener(e -> clearChatConversation(false));
+        JButton clearAttach = new JButton("Detach");
+        clearAttach.setToolTipText("Clear attached HTTP / issue context");
+        clearAttach.addActionListener(e -> clearChatAttachment());
+        buttons.add(chatSendButton);
+        buttons.add(clearChat);
+        buttons.add(clearAttach);
+        buttons.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 0));
+        JPanel promptRow = new JPanel(new BorderLayout(4, 0));
+        promptRow.add(inputScroll, BorderLayout.CENTER);
+        promptRow.add(buttons, BorderLayout.EAST);
+        south.add(promptRow, BorderLayout.CENTER);
+
+        root.add(south, BorderLayout.SOUTH);
+        return root;
+    }
+
+    private JPanel buildChatCheckBar() {
+        JPanel wrap = new JPanel(new BorderLayout(0, 2));
+        JLabel label = new JLabel("Checks");
+        label.setToolTipText("Sends a focused hunt against the Site Map / Proxy digest. Turns Include Burp traffic on.");
+        Color muted = UIManager.getColor("Label.disabledForeground");
+        if (muted != null) {
+            label.setForeground(muted);
+        }
+        wrap.add(label, BorderLayout.WEST);
+        JPanel row = new JPanel(new GridLayout(2, 3, 4, 4));
+        chatCheckButtons.clear();
+        for (String[] check : CHAT_VULN_CHECKS) {
+            JButton button = new JButton(check[0]);
+            button.setToolTipText(check[1]);
+            final String prompt = check[1];
+            button.addActionListener(e -> sendChatCheck(prompt));
+            chatCheckButtons.add(button);
+            row.add(button);
+        }
+        wrap.add(row, BorderLayout.CENTER);
         return wrap;
+    }
+
+    private void focusChatTab() {
+        if (suiteTabs == null) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            if (suiteTabs == null) {
+                return;
+            }
+            for (int i = 0; i < suiteTabs.getTabCount(); i++) {
+                if ("Chat".equals(suiteTabs.getTitleAt(i))) {
+                    suiteTabs.setSelectedIndex(i);
+                    if (chatInputArea != null) {
+                        chatInputArea.requestFocusInWindow();
+                    }
+                    return;
+                }
+            }
+        });
+    }
+
+    private void refreshChatHistoryView() {
+        if (chatHistoryArea == null) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Type a question below, use a Checks button, or attach traffic from a right-click menu.\n\n");
+        for (ChatTurn turn : chatTurns) {
+            sb.append("── ").append(turn.role).append(" ──\n");
+            sb.append(turn.text).append("\n\n");
+        }
+        if (chatBusy) {
+            sb.append("── Assistant ──\n(thinking…)\n\n");
+        }
+        chatHistoryArea.setText(sb.toString());
+        chatHistoryArea.setCaretPosition(chatHistoryArea.getDocument().getLength());
+    }
+
+    private void setChatBusy(boolean busy) {
+        chatBusy = busy;
+        if (chatSendButton != null) {
+            chatSendButton.setEnabled(!busy);
+        }
+        for (JButton button : chatCheckButtons) {
+            button.setEnabled(!busy);
+        }
+        if (chatInputArea != null) {
+            chatInputArea.setEnabled(!busy);
+        }
+        refreshChatHistoryView();
+    }
+
+    private void clearChatConversation(boolean keepAttachment) {
+        chatTurns.clear();
+        if (!keepAttachment) {
+            clearChatAttachment();
+        }
+        setChatBusy(false);
+        if (chatStatusLabel != null) {
+            chatStatusLabel.setText("Conversation cleared. Defaults to the local LLM.");
+        }
+    }
+
+    private void clearChatAttachment() {
+        chatAttachedHttp = null;
+        chatAttachedExtra = null;
+        if (chatAttachmentLabel != null) {
+            chatAttachmentLabel.setText("No HTTP attached.");
+        }
+        if (chatIncludeHttpCheckbox != null) {
+            chatIncludeHttpCheckbox.setSelected(true);
+        }
+    }
+
+    private void attachTrafficToChat(HttpRequestResponse rr, String extraContext) {
+        chatAttachedHttp = rr;
+        chatAttachedExtra = extraContext;
+        String urlLabel = "HTTP request";
+        try {
+            if (rr != null && rr.request() != null && rr.request().url() != null) {
+                urlLabel = rr.request().url();
+            }
+        } catch (Exception ignored) {
+        }
+        String extraNote = (extraContext != null && !extraContext.isEmpty())
+                ? " + extra context (" + extraContext.length() + " chars)"
+                : "";
+        final String label = "Attached: " + truncateForIssueTitle(urlLabel, 90) + extraNote;
+        SwingUtilities.invokeLater(() -> {
+            if (chatAttachmentLabel != null) {
+                chatAttachmentLabel.setText(label);
+            }
+            if (chatIncludeHttpCheckbox != null) {
+                chatIncludeHttpCheckbox.setSelected(true);
+            }
+            focusChatTab();
+        });
+        appendDashboardActivity("Chat attachment — " + label);
+        api.logging().raiseInfoEvent("AI Auditor: attached to Chat. Open AI Auditor → Chat and type a prompt.");
+    }
+
+    private void attachIssuesToChat(List<AuditIssue> issues) {
+        if (issues == null || issues.isEmpty()) {
+            return;
+        }
+        AuditIssue first = issues.get(0);
+        List<HttpRequestResponse> traffic = resolveTrafficForIssue(first);
+        HttpRequestResponse rr = (traffic != null && !traffic.isEmpty()) ? traffic.get(0) : null;
+        StringBuilder extra = new StringBuilder();
+        extra.append(issues.size() == 1 ? "=== Burp issue ===\n" : "=== Burp issues (" + issues.size() + ") ===\n");
+        for (AuditIssue issue : issues) {
+            extra.append("Name: ").append(issue.name()).append("\n");
+            extra.append("Severity: ").append(issue.severity()).append("\n");
+            extra.append("Confidence: ").append(issue.confidence()).append("\n");
+            if (issue.detail() != null && !issue.detail().isEmpty()) {
+                extra.append("Detail:\n").append(issue.detail()).append("\n");
+            }
+            extra.append("\n");
+        }
+        attachTrafficToChat(rr, extra.toString());
+    }
+
+    private String extractSelectedEditorText(MessageEditorHttpRequestResponse editor) {
+        Optional<Range> selectionRange = editor.selectionOffsets();
+        if (!selectionRange.isPresent()) {
+            return null;
+        }
+        int start = selectionRange.get().startIndexInclusive();
+        int end = selectionRange.get().endIndexExclusive();
+        String editorContent = editor.selectionContext() == MessageEditorHttpRequestResponse.SelectionContext.REQUEST
+                ? editor.requestResponse().request().toString()
+                : editor.requestResponse().response() != null ? editor.requestResponse().response().toString() : "";
+        if (start >= 0 && end <= editorContent.length() && start < end) {
+            return editorContent.substring(start, end);
+        }
+        return null;
+    }
+
+    private String buildChatPrompt(String currentQuestion, boolean includeTraffic) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are a senior penetration tester sitting inside Burp Suite with the operator. ");
+        sb.append("The EVIDENCE blocks below are captured Proxy history / Site Map (and any attached request). ");
+        sb.append("Answer the operator's question from that evidence. ");
+        sb.append("Do the analysis yourself: list concrete method, URL, and field/form names. ");
+        sb.append("Never tell the operator to open HTTP History, filter traffic, crawl, or send items to Repeater ");
+        sb.append("instead of answering. If evidence is empty or has no matches, say so and report the scan counts. ");
+        sb.append("Do not invent endpoints that are not in the evidence. ");
+        sb.append("Do not return JSON scanner findings unless the operator asks for that format.\n\n");
+
+        if (includeTraffic) {
+            sb.append(collectBurpTrafficDigest(currentQuestion)).append("\n\n");
+            if (chatAttachedHttp != null && chatAttachedHttp.request() != null) {
+                String traffic = "=== Attached HTTP request ===\n"
+                        + chatAttachedHttp.request().toString()
+                        + "\n\n=== Attached HTTP response ===\n"
+                        + (chatAttachedHttp.response() != null ? chatAttachedHttp.response().toString() : "(no response captured)");
+                sb.append(trimPocEvidenceForPrompt(traffic, "chat attachment")).append("\n\n");
+            }
+            if (chatAttachedExtra != null && !chatAttachedExtra.isEmpty()) {
+                sb.append("=== Extra context (selected text or issue) ===\n");
+                sb.append(truncateMiddleWithNotice(chatAttachedExtra, 20_000)).append("\n\n");
+            }
+        } else {
+            sb.append("=== Evidence ===\n(Operator turned off Include Burp traffic. No Proxy history was attached.)\n\n");
+        }
+
+        int start = Math.max(0, chatTurns.size() - CHAT_HISTORY_MAX_TURNS);
+        if (start < chatTurns.size()) {
+            sb.append("=== Conversation so far ===\n");
+            for (int i = start; i < chatTurns.size(); i++) {
+                ChatTurn turn = chatTurns.get(i);
+                sb.append(turn.role).append(":\n").append(turn.text).append("\n\n");
+            }
+        }
+
+        sb.append("=== Current question ===\n").append(currentQuestion);
+        if (sb.length() > CHAT_PROMPT_MAX_CHARS) {
+            return truncateMiddleWithNotice(sb.toString(), CHAT_PROMPT_MAX_CHARS);
+        }
+        return sb.toString();
+    }
+
+    private String collectBurpTrafficDigest(String question) {
+        EmailTrafficAcc acc = new EmailTrafficAcc();
+        List<String> terms = extractSearchTerms(question);
+        boolean wantEmail = questionLooksLikeEmailOrFormHunt(question, terms);
+        boolean wantBodies = wantEmail || questionLooksLikeBodyHunt(question, terms);
+        int proxyTotal = 0;
+        int proxyConsidered = 0;
+        boolean restrictedToScope = false;
+        try {
+            List<ProxyHttpRequestResponse> hist = api.proxy().history();
+            proxyTotal = hist != null ? hist.size() : 0;
+            long deadline = System.currentTimeMillis() + CHAT_SCAN_BUDGET_MS;
+            LinkedHashSet<String> prefixes = new LinkedHashSet<>();
+            if (hist != null && !hist.isEmpty()) {
+                int peek = Math.min(hist.size(), 80);
+                for (int i = hist.size() - 1; i >= hist.size() - peek; i--) {
+                    try {
+                        HttpRequest req = hist.get(i) != null ? hist.get(i).request() : null;
+                        if (req != null && req.isInScope()) {
+                            restrictedToScope = true;
+                            break;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                int from = Math.max(0, hist.size() - CHAT_HISTORY_SCAN_MAX_ITEMS);
+                for (int i = hist.size() - 1; i >= from; i--) {
+                    if (System.currentTimeMillis() > deadline) {
+                        break;
+                    }
+                    ProxyHttpRequestResponse item = hist.get(i);
+                    if (item == null || item.request() == null) {
+                        continue;
+                    }
+                    HttpRequest req = item.request();
+                    if (restrictedToScope && !safeIsInScope(req)) {
+                        continue;
+                    }
+                    if (prefixes.size() < 16) {
+                        String prefix = originPrefix(req);
+                        if (prefix != null) {
+                            prefixes.add(prefix);
+                        }
+                    }
+                    proxyConsidered++;
+                    noteQueryMatch(acc, terms, req);
+                    HttpResponse histRes = item.hasResponse() ? item.response() : null;
+                    if (wantEmail) {
+                        collectEmailEvidenceFromExchange(req, histRes, acc);
+                    } else if (wantBodies) {
+                        collectTermSnippetsFromExchange(req, histRes, terms, acc);
+                    }
+                }
+            }
+
+            List<HttpRequestResponse> map = loadFullSiteMap(prefixes);
+            acc.siteMapItems = map.size();
+            List<HttpRequestResponse> matchBodies = new ArrayList<>();
+            List<HttpRequestResponse> extraBodies = new ArrayList<>();
+            for (HttpRequestResponse rr : map) {
+                if (rr == null || rr.request() == null) {
+                    continue;
+                }
+                HttpRequest req = rr.request();
+                if (restrictedToScope && !safeIsInScope(req)) {
+                    continue;
+                }
+                acc.siteMapInScope++;
+                boolean matched = noteQueryMatch(acc, terms, req);
+                if (terms.isEmpty()) {
+                    String method = req.method() != null ? req.method() : "?";
+                    String url = req.url() != null ? req.url() : "";
+                    acc.queryMatches.add(method + " " + url);
+                }
+                if (matched) {
+                    matchBodies.add(rr);
+                } else if (wantEmail || (wantBodies && looksLikeTextAsset(req))) {
+                    extraBodies.add(rr);
+                }
+            }
+            List<HttpRequestResponse> deepCandidates = new ArrayList<>(matchBodies);
+            deepCandidates.addAll(extraBodies);
+            int bodyScans = 0;
+            for (HttpRequestResponse rr : deepCandidates) {
+                if (bodyScans >= CHAT_SITEMAP_BODY_SCAN_MAX
+                        || System.currentTimeMillis() > deadline) {
+                    break;
+                }
+                if (wantEmail) {
+                    collectEmailEvidenceFromExchange(rr.request(), rr.response(), acc);
+                } else {
+                    collectTermSnippetsFromExchange(rr.request(), rr.response(), terms, acc);
+                }
+                acc.bodyDeepScans++;
+                bodyScans++;
+            }
+        } catch (Exception e) {
+            return "=== Burp traffic digest ===\nCould not read Proxy history / Site Map: " + e.getMessage() + "\n";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== Burp Site Map + traffic (answer from this; do not send the operator to HTTP History) ===\n");
+        sb.append("Site Map items: ").append(acc.siteMapItems)
+                .append(restrictedToScope ? " (in-scope " + acc.siteMapInScope + ")" : "")
+                .append(". Proxy history: ").append(proxyTotal)
+                .append(" (body-sampled ").append(proxyConsidered).append(" newest in-scope). ")
+                .append("Query terms: ").append(terms.isEmpty() ? "(none — URL inventory only)" : String.join(", ", terms))
+                .append(". Body deep-scans: ").append(acc.bodyDeepScans).append(".\n");
+        sb.append("Every Site Map URL was checked against the query (metadata). Response bodies are opened only for matches")
+                .append(wantEmail ? " and email/form hunts" : wantBodies ? " and JS/HTML/JSON body hunts" : "").append(".\n\n");
+
+        sb.append(terms.isEmpty() ? "Site Map URL inventory:\n" : "URLs matching the question:\n");
+        if (acc.queryMatches.isEmpty()) {
+            sb.append(terms.isEmpty()
+                    ? "(Site Map was empty or out of scope)\n"
+                    : "(no URL/path matches for those terms in the Site Map)\n");
+        } else {
+            int n = 0;
+            for (String line : acc.queryMatches) {
+                sb.append("- ").append(line).append("\n");
+                if (++n >= CHAT_QUERY_MATCH_LIST_MAX) {
+                    sb.append("- … ").append(acc.queryMatches.size() - n).append(" more matching URLs omitted\n");
+                    break;
+                }
+            }
+        }
+
+        if (!acc.termSnippets.isEmpty()) {
+            sb.append("\nBody snippets matching query terms:\n");
+            int n = 0;
+            for (String line : acc.termSnippets) {
+                sb.append("- ").append(line).append("\n");
+                if (++n >= 60) {
+                    sb.append("- … ").append(acc.termSnippets.size() - n).append(" more snippets omitted\n");
+                    break;
+                }
+            }
+        }
+
+        if (wantEmail) {
+            sb.append("\nNon-authentication email collection points:\n");
+            if (acc.nonAuth.isEmpty()) {
+                sb.append("(none found in sampled bodies)\n");
+            } else {
+                int n = 0;
+                for (String line : acc.nonAuth) {
+                    sb.append("- ").append(line).append("\n");
+                    if (++n >= 80) {
+                        sb.append("- … ").append(acc.nonAuth.size() - n).append(" more unique hits omitted\n");
+                        break;
+                    }
+                }
+            }
+            sb.append("\nAuthentication / identity-lifecycle email fields:\n");
+            if (acc.authRelated.isEmpty()) {
+                sb.append("(none)\n");
+            } else {
+                int n = 0;
+                for (String line : acc.authRelated) {
+                    sb.append("- ").append(line).append("\n");
+                    if (++n >= 20) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (!acc.jsScanned.isEmpty()) {
+            sb.append("\nJavaScript files reviewed (bodies):\n");
+            int n = 0;
+            for (String line : acc.jsScanned) {
+                sb.append("- ").append(line).append("\n");
+                if (++n >= 30) {
+                    sb.append("- … ").append(acc.jsScanned.size() - n).append(" more JS files\n");
+                    break;
+                }
+            }
+        }
+        if (sb.length() > CHAT_DIGEST_MAX_CHARS) {
+            return truncateMiddleWithNotice(sb.toString(), CHAT_DIGEST_MAX_CHARS);
+        }
+        return sb.toString();
+    }
+
+    private List<String> extractSearchTerms(String question) {
+        LinkedHashSet<String> terms = new LinkedHashSet<>();
+        if (question == null || question.isBlank()) {
+            return new ArrayList<>();
+        }
+        Matcher quoted = Pattern.compile("\"([^\"]{2,80})\"|'([^']{2,80})'").matcher(question);
+        while (quoted.find()) {
+            String q = quoted.group(1) != null ? quoted.group(1) : quoted.group(2);
+            if (q != null && !q.isBlank()) {
+                terms.add(q.toLowerCase(Locale.ROOT).trim());
+            }
+        }
+        for (String w : question.toLowerCase(Locale.ROOT).split("[^a-z0-9_.+-]+")) {
+            if (w.isEmpty() || CHAT_STOPWORDS.contains(w)) {
+                continue;
+            }
+            if (w.length() < 2) {
+                continue;
+            }
+            if (w.length() == 2 && !(w.equals("js") || w.equals("s3") || w.equals("id"))) {
+                continue;
+            }
+            terms.add(w);
+            if (w.equals("javascript")) {
+                terms.add("js");
+                terms.add(".js");
+            }
+            if (w.equals("forms")) {
+                terms.add("form");
+            }
+        }
+        return new ArrayList<>(terms);
+    }
+
+    private boolean questionLooksLikeEmailOrFormHunt(String question, List<String> terms) {
+        String q = question != null ? question.toLowerCase(Locale.ROOT) : "";
+        if (q.contains("email") || q.contains("e-mail") || q.contains("newsletter") || q.contains("form")) {
+            return true;
+        }
+        for (String t : terms) {
+            if ("email".equals(t) || "forms".equals(t) || "form".equals(t) || "newsletter".equals(t)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean questionLooksLikeBodyHunt(String question, List<String> terms) {
+        String q = question != null ? question.toLowerCase(Locale.ROOT) : "";
+        if (q.contains("secret") || q.contains("token") || q.contains("jwt") || q.contains("xss")
+                || q.contains("javascript") || q.contains("graphql") || q.contains("swagger")
+                || q.contains("hidden") || q.contains("api key")) {
+            return true;
+        }
+        if (terms == null) {
+            return false;
+        }
+        for (String t : terms) {
+            if (t == null) {
+                continue;
+            }
+            switch (t) {
+                case "secret":
+                case "secrets":
+                case "token":
+                case "jwt":
+                case "xss":
+                case "javascript":
+                case "graphql":
+                case "swagger":
+                case "openapi":
+                case "actuator":
+                    return true;
+                default:
+                    break;
+            }
+        }
+        return false;
+    }
+
+    private boolean looksLikeTextAsset(HttpRequest req) {
+        if (req == null) {
+            return false;
+        }
+        String path = req.path();
+        if (path == null || path.isEmpty()) {
+            return true;
+        }
+        String pl = path.toLowerCase(Locale.ROOT);
+        int q = pl.indexOf('?');
+        if (q >= 0) {
+            pl = pl.substring(0, q);
+        }
+        int slash = pl.lastIndexOf('/');
+        String last = slash >= 0 ? pl.substring(slash + 1) : pl;
+        int dot = last.lastIndexOf('.');
+        if (dot < 0) {
+            return true;
+        }
+        String ext = last.substring(dot);
+        return ext.equals(".js") || ext.equals(".mjs") || ext.equals(".cjs") || ext.equals(".json")
+                || ext.equals(".html") || ext.equals(".htm") || ext.equals(".xml") || ext.equals(".txt")
+                || ext.equals(".map") || ext.equals(".graphql");
+    }
+
+    private void collectTermSnippetsFromExchange(HttpRequest req, HttpResponse res, List<String> terms,
+            EmailTrafficAcc acc) {
+        if (req == null || res == null || terms == null || terms.isEmpty() || acc == null) {
+            return;
+        }
+        if (shouldSkipChatTraffic(req, res)) {
+            return;
+        }
+        try {
+            if (res.body() == null || res.body().length() > CHAT_MAX_BODY_BYTES) {
+                return;
+            }
+            String body = res.bodyToString();
+            if (body == null || body.isEmpty()) {
+                return;
+            }
+            String lower = body.toLowerCase(Locale.ROOT);
+            for (String term : terms) {
+                if (!isSnippetTerm(term)) {
+                    continue;
+                }
+                int i = lower.indexOf(term.toLowerCase(Locale.ROOT));
+                if (i < 0) {
+                    continue;
+                }
+                String method = req.method() != null ? req.method() : "?";
+                String url = req.url() != null ? req.url() : "";
+                acc.termSnippets.add(method + " " + truncateForIssueTitle(url, 160)
+                        + " | " + term + " | " + compactSnippet(body, i));
+                if (isJavaScriptAsset(req, contentTypeLower(res))) {
+                    acc.jsScanned.add(method + " " + truncateForIssueTitle(url, 180));
+                }
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static boolean isSnippetTerm(String term) {
+        if (term == null) {
+            return false;
+        }
+        String t = term.toLowerCase(Locale.ROOT);
+        if (t.equals("jwt") || t.equals("xss") || t.equals("sso") || t.equals("idor") || t.equals("email")) {
+            return true;
+        }
+        if (t.length() < 5) {
+            return false;
+        }
+        switch (t) {
+            case "method":
+            case "names":
+            case "field":
+            case "fields":
+            case "evidence":
+            case "quote":
+            case "short":
+            case "likely":
+            case "false":
+            case "javascript":
+            case "collect":
+            case "surfaces":
+            case "candidates":
+            case "invent":
+            case "testing":
+            case "visible":
+            case "obvious":
+            case "source":
+            case "redacted":
+            case "snippet":
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    private boolean noteQueryMatch(EmailTrafficAcc acc, List<String> terms, HttpRequest req) {
+        if (req == null || terms == null || terms.isEmpty()) {
+            return false;
+        }
+        String url = req.url() != null ? req.url() : "";
+        String path = req.path() != null ? req.path() : "";
+        String hay = (url + " " + path).toLowerCase(Locale.ROOT);
+        List<String> hits = new ArrayList<>();
+        for (String term : terms) {
+            if (term != null && !term.isEmpty() && hay.contains(term.toLowerCase(Locale.ROOT))) {
+                hits.add(term);
+            }
+        }
+        if (hits.isEmpty()) {
+            return false;
+        }
+        String method = req.method() != null ? req.method() : "?";
+        acc.queryMatches.add(method + " " + url + " | terms=" + String.join(",", hits));
+        return true;
+    }
+
+    /**
+     * Full Site Map via unfiltered {@code requestResponses()}. Prefix filter is only a fallback if that list is empty.
+     * Callers must not {@code bodyToString()} every item — metadata matching is cheap; bodies are for hits only.
+     */
+    private List<HttpRequestResponse> loadFullSiteMap(Set<String> prefixes) {
+        try {
+            List<HttpRequestResponse> direct = api.siteMap().requestResponses();
+            if (direct != null && !direct.isEmpty()) {
+                return direct;
+            }
+        } catch (Exception e) {
+            log("Site Map requestResponses() failed: " + e.getMessage(), LogCategory.GENERAL);
+        }
+        return loadSiteMapByPrefixes(prefixes);
+    }
+
+    /**
+     * Prefix-only Site Map lookups used when the unfiltered map is empty.
+     */
+    private List<HttpRequestResponse> loadSiteMapByPrefixes(Set<String> prefixes) {
+        List<HttpRequestResponse> all = new ArrayList<>();
+        if (prefixes == null || prefixes.isEmpty()) {
+            return all;
+        }
+        for (String prefix : prefixes) {
+            try {
+                List<HttpRequestResponse> part = api.siteMap().requestResponses(SiteMapFilter.prefixFilter(prefix));
+                if (part != null) {
+                    all.addAll(part);
+                }
+            } catch (Exception e) {
+                log("Site Map prefixFilter(" + prefix + ") failed: " + e.getMessage(), LogCategory.GENERAL);
+            }
+        }
+        return all;
+    }
+
+    private String originPrefix(HttpRequest req) {
+        if (req == null || req.httpService() == null) {
+            return null;
+        }
+        HttpService svc = req.httpService();
+        String host = svc.host();
+        if (host == null || host.isEmpty()) {
+            return null;
+        }
+        boolean https = svc.secure();
+        int port = svc.port();
+        StringBuilder b = new StringBuilder(https ? "https://" : "http://");
+        b.append(host);
+        if (port > 0 && !(https && port == 443) && !(!https && port == 80)) {
+            b.append(':').append(port);
+        }
+        return b.toString();
+    }
+
+    private boolean safeIsInScope(HttpRequest req) {
+        try {
+            return req != null && req.isInScope();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void collectEmailEvidenceFromExchange(HttpRequest req, HttpResponse res, EmailTrafficAcc acc) {
+        if (req == null || shouldSkipChatTraffic(req, res)) {
+            return;
+        }
+        String method = req.method() != null ? req.method() : "?";
+        String url = req.url() != null ? req.url() : req.path();
+        String path = req.pathWithoutQuery() != null ? req.pathWithoutQuery() : req.path();
+        boolean auth = looksLikeAuthLifecyclePath(path) || looksLikeAuthLifecyclePath(url);
+
+        LinkedHashSet<String> fields = new LinkedHashSet<>();
+        try {
+            List<ParsedHttpParameter> params = req.parameters();
+            if (params != null) {
+                for (ParsedHttpParameter p : params) {
+                    if (p != null && isEmailRelatedParamName(p.name())) {
+                        fields.add(p.name());
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            String body = req.bodyToString();
+            if (body != null && fields.isEmpty() && body.length() < 100_000 && looksLikeJsonEmailKey(body)) {
+                fields.add("json:email");
+            }
+        } catch (Exception ignored) {
+        }
+
+        LinkedHashSet<String> formHits = new LinkedHashSet<>();
+        boolean sawHtml = false;
+        if (res != null) {
+            String ct = contentTypeLower(res);
+            boolean js = isJavaScriptAsset(req, ct);
+            try {
+                if (res.body() != null && res.body().length() > CHAT_MAX_BODY_BYTES) {
+                    if (js) {
+                        acc.jsFiles++;
+                        acc.jsScanned.add(method + " " + truncateForIssueTitle(url, 180) + " (skipped, body too large)");
+                    }
+                } else {
+                    String body = res.bodyToString();
+                    if (body != null && !body.isEmpty() && bodyMayContainEmailEvidence(body)) {
+                        if (js) {
+                            acc.jsFiles++;
+                            String shortUrl = url != null && url.length() > 180 ? url.substring(0, 180) + "…" : url;
+                            acc.jsScanned.add(method + " " + shortUrl);
+                            formHits.addAll(extractEmailEvidenceFromJavaScript(body, url));
+                        } else if (ct.contains("html") || ct.contains("xml") || ct.isEmpty()) {
+                            sawHtml = ct.contains("html") || body.contains("<form") || body.contains("<FORM");
+                            formHits.addAll(extractEmailFormsFromHtml(body, url));
+                        } else if (ct.contains("json") && looksLikeJsonEmailKey(body)) {
+                            formHits.add("JSON response contains email-related keys");
+                        }
+                    } else if (js && acc.jsScanned.size() < 30) {
+                        acc.jsFiles++;
+                        acc.jsScanned.add(method + " " + truncateForIssueTitle(url, 180) + " (no email strings)");
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (!fields.isEmpty()) {
+            String line = method + " " + url + " | request fields: " + String.join(", ", fields);
+            (auth ? acc.authRelated : acc.nonAuth).add(line);
+        }
+        for (String formLine : formHits) {
+            boolean formAuth = auth || looksLikeAuthLifecyclePath(formLine);
+            (formAuth ? acc.authRelated : acc.nonAuth).add(method + " " + url + " | " + formLine);
+        }
+        if (fields.isEmpty() && formHits.isEmpty() && sawHtml && acc.htmlNoEmail.size() < 40) {
+            acc.htmlNoEmail.add(method + " " + (url != null && url.length() > 180 ? url.substring(0, 180) + "…" : url));
+        }
+    }
+
+    private static boolean bodyMayContainEmailEvidence(String body) {
+        if (body == null || body.isEmpty()) {
+            return false;
+        }
+        return body.contains("email") || body.contains("Email") || body.contains("EMAIL")
+                || body.contains("<form") || body.contains("<FORM")
+                || body.contains("newsletter") || body.contains("Newsletter")
+                || body.contains("subscribe") || body.contains("Subscribe");
+    }
+
+    private static String contentTypeLower(HttpResponse res) {
+        try {
+            String hv = res.headerValue("Content-Type");
+            return hv != null ? hv.toLowerCase(Locale.ROOT) : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private boolean isJavaScriptAsset(HttpRequest req, String contentTypeLower) {
+        if (contentTypeLower != null && (contentTypeLower.contains("javascript") || contentTypeLower.contains("ecmascript"))) {
+            return true;
+        }
+        String path = req != null ? req.path() : null;
+        if (path == null) {
+            return false;
+        }
+        String pl = path.toLowerCase(Locale.ROOT);
+        int q = pl.indexOf('?');
+        if (q >= 0) {
+            pl = pl.substring(0, q);
+        }
+        return pl.endsWith(".js") || pl.endsWith(".mjs") || pl.endsWith(".cjs");
+    }
+
+    private boolean shouldSkipChatTraffic(HttpRequest req, HttpResponse res) {
+        String path = req.path();
+        if (path != null) {
+            String pl = path.toLowerCase(Locale.ROOT);
+            int q = pl.indexOf('?');
+            if (q >= 0) {
+                pl = pl.substring(0, q);
+            }
+            if (pl.endsWith(".png") || pl.endsWith(".jpg") || pl.endsWith(".jpeg") || pl.endsWith(".gif")
+                    || pl.endsWith(".webp") || pl.endsWith(".ico") || pl.endsWith(".woff") || pl.endsWith(".woff2")
+                    || pl.endsWith(".ttf") || pl.endsWith(".eot") || pl.endsWith(".mp4") || pl.endsWith(".mp3")
+                    || pl.endsWith(".pdf") || pl.endsWith(".zip") || pl.endsWith(".css") || pl.endsWith(".map")) {
+                return true;
+            }
+        }
+        if (res != null) {
+            try {
+                String ct = res.headerValue("Content-Type");
+                if (ct != null) {
+                    String c = ct.toLowerCase(Locale.ROOT);
+                    if (c.contains("image/") || c.contains("font/") || c.contains("video/") || c.contains("audio/")
+                            || c.contains("octet-stream")) {
+                        return true;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    private boolean isEmailRelatedParamName(String name) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        String n = name.toLowerCase(Locale.ROOT);
+        return n.contains("email") || n.contains("e-mail") || n.contains("e_mail")
+                || n.equals("mail") || n.contains("mailaddr") || n.contains("mail_addr")
+                || n.contains("newsletter") || n.equals("subscribe");
+    }
+
+    private boolean looksLikeJsonEmailKey(String body) {
+        String s = body.toLowerCase(Locale.ROOT);
+        return s.contains("\"email\"") || s.contains("\"e-mail\"") || s.contains("\"user_email\"")
+                || s.contains("\"emailaddress\"") || s.contains("\"newsletter\"");
+    }
+
+    private boolean looksLikeAuthLifecyclePath(String pathOrUrl) {
+        if (pathOrUrl == null || pathOrUrl.isEmpty()) {
+            return false;
+        }
+        String p = pathOrUrl.toLowerCase(Locale.ROOT);
+        return p.contains("/login") || p.contains("/log-in") || p.contains("log_in")
+                || p.contains("/signin") || p.contains("/sign-in") || p.contains("sign_in")
+                || p.contains("/signup") || p.contains("/sign-up") || p.contains("sign_up")
+                || p.contains("/register") || p.contains("/registration")
+                || p.contains("/oauth") || p.contains("/sso") || p.contains("/saml") || p.contains("/oidc")
+                || p.contains("/forgot") || p.contains("reset-password") || p.contains("resetpassword")
+                || p.contains("forgot-password") || p.contains("/recover")
+                || p.contains("/passwd") || p.contains("/password")
+                || p.contains("/mfa") || p.contains("/2fa") || p.contains("/totp")
+                || p.contains("/authenticate") || p.contains("/authorization")
+                || p.contains("/auth/") || p.contains("/auth?") || p.endsWith("/auth");
+    }
+
+    private List<String> extractEmailFormsFromHtml(String html, String pageUrl) {
+        List<String> hits = new ArrayList<>();
+        if (html == null || html.isEmpty()) {
+            return hits;
+        }
+        String slice = html.length() > CHAT_HTML_SCAN_CHARS ? html.substring(0, CHAT_HTML_SCAN_CHARS) : html;
+        Matcher forms = HTML_FORM_PATTERN.matcher(slice);
+        int found = 0;
+        while (forms.find() && found < 20) {
+            String form = forms.group();
+            if (!HTML_EMAIL_INPUT_PATTERN.matcher(form).find() && !form.toLowerCase(Locale.ROOT).contains("email")) {
+                continue;
+            }
+            String action = firstGroup(FORM_ACTION_PATTERN, form, pageUrl);
+            String method = firstGroup(FORM_METHOD_PATTERN, form, "GET");
+            LinkedHashSet<String> names = new LinkedHashSet<>();
+            Matcher namesM = INPUT_NAME_PATTERN.matcher(form);
+            while (namesM.find()) {
+                String n = namesM.group(1);
+                if (isEmailRelatedParamName(n) || "email".equalsIgnoreCase(n)) {
+                    names.add(n);
+                }
+            }
+            String formLower = form.toLowerCase(Locale.ROOT);
+            if (formLower.contains("type=\"email\"") || formLower.contains("type='email'")) {
+                if (names.isEmpty()) {
+                    names.add("type=email");
+                }
+            }
+            if (names.isEmpty()) {
+                continue;
+            }
+            hits.add("HTML form method=" + method.toUpperCase(Locale.ROOT) + " action=" + action
+                    + " fields=" + String.join(",", names));
+            found++;
+        }
+        if (hits.isEmpty() && HTML_EMAIL_INPUT_PATTERN.matcher(slice).find()) {
+            hits.add("HTML email input (no wrapping form tag) on " + pageUrl);
+        }
+        return hits;
+    }
+
+    private List<String> extractEmailEvidenceFromJavaScript(String js, String scriptUrl) {
+        List<String> hits = new ArrayList<>();
+        if (js == null || js.isEmpty()) {
+            return hits;
+        }
+        String slice = js.length() > CHAT_HTML_SCAN_CHARS ? js.substring(0, CHAT_HTML_SCAN_CHARS) : js;
+        addJsPatternHits(hits, JS_TYPE_EMAIL_PATTERN, slice, "JS type=email");
+        addJsPatternHits(hits, JS_NAME_EMAIL_PATTERN, slice, "JS email field name");
+        addJsPatternHits(hits, JS_EMAIL_KEY_PATTERN, slice, "JS email object key");
+        addJsPatternHits(hits, JS_APPEND_EMAIL_PATTERN, slice, "JS FormData/email append");
+        Matcher urls = JS_CONTACT_URL_PATTERN.matcher(slice);
+        int urlHits = 0;
+        while (urls.find() && urlHits < 8) {
+            String path = urls.group(1);
+            if (path != null && !looksLikeAuthLifecyclePath(path)) {
+                hits.add("JS endpoint string: " + path);
+                urlHits++;
+            }
+        }
+        if (hits.size() > 12) {
+            return new ArrayList<>(hits.subList(0, 12));
+        }
+        return hits;
+    }
+
+    private static void addJsPatternHits(List<String> hits, Pattern pattern, String slice, String label) {
+        Matcher m = pattern.matcher(slice);
+        int n = 0;
+        while (m.find() && n < 4) {
+            hits.add(label + ": …" + compactSnippet(slice, m.start()) + "…");
+            n++;
+        }
+    }
+
+    private static String compactSnippet(String text, int index) {
+        int a = Math.max(0, index - 40);
+        int b = Math.min(text.length(), index + 60);
+        return text.substring(a, b).replaceAll("\\s+", " ").trim();
+    }
+
+    private static String firstGroup(Pattern pattern, String text, String fallback) {
+        Matcher m = pattern.matcher(text);
+        if (m.find() && m.group(1) != null && !m.group(1).isEmpty()) {
+            return m.group(1);
+        }
+        return fallback != null ? fallback : "";
+    }
+
+    private void sendChatCheck(String cannedPrompt) {
+        if (chatIncludeHttpCheckbox != null) {
+            chatIncludeHttpCheckbox.setSelected(true);
+        }
+        sendChatPromptText(cannedPrompt, true, false);
+    }
+
+    private void sendChatPrompt() {
+        String userText = chatInputArea != null ? chatInputArea.getText() : "";
+        sendChatPromptText(userText, false, true);
+    }
+
+    private void sendChatPromptText(String userText, boolean forceTraffic, boolean clearInput) {
+        if (chatBusy) {
+            return;
+        }
+        if (userText == null || userText.trim().isEmpty()) {
+            if (chatStatusLabel != null) {
+                chatStatusLabel.setText("Type a prompt first, or use a Checks button.");
+            }
+            return;
+        }
+        userText = userText.trim();
+
+        String selectedModel = validateChatModelPreflight();
+        if (selectedModel == null) {
+            SwingUtilities.invokeLater(() -> {
+                if (chatStatusLabel != null) {
+                    chatStatusLabel.setText("Blocked — set Local LLM URL + model id on Connect (or Premium Model for PoCs as fallback), then Save.");
+                }
+            });
+            return;
+        }
+
+        boolean includeTraffic = forceTraffic
+                || chatIncludeHttpCheckbox == null
+                || chatIncludeHttpCheckbox.isSelected();
+        chatTurns.add(new ChatTurn("You", userText));
+
+        final String model = selectedModel;
+        final String apiKey = getApiKeyForModel(selectedModel);
+        final String question = userText;
+        final boolean includeTrafficFinal = includeTraffic;
+
+        if (clearInput && chatInputArea != null) {
+            chatInputArea.setText("");
+        }
+        if (chatStatusLabel != null) {
+            chatStatusLabel.setText(includeTraffic ? "Scanning full Site Map…" : "Sending to " + model + "…");
+        }
+        setChatBusy(true);
+        appendDashboardActivity("Chat prompt sent — " + model + " — " + truncateForIssueTitle(question, 80));
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                String prompt = buildChatPrompt(question, includeTrafficFinal);
+                SwingUtilities.invokeLater(() -> {
+                    if (chatStatusLabel != null) {
+                        chatStatusLabel.setText("Sending to " + model + "…");
+                    }
+                });
+                return sendToAI(model, apiKey, prompt, false);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, threadPoolManager.getExecutor()).thenAccept(aiResponse -> {
+            String text;
+            try {
+                text = extractContentFromResponse(aiResponse, model, false);
+            } catch (Exception e) {
+                text = "";
+            }
+            if (text != null && !text.isEmpty()) {
+                text = cleanLLMResponse(text, false);
+            }
+            if (text == null || text.isEmpty()) {
+                text = "(No text extracted from model response. Check Extension Output.)";
+            }
+            final String reply = text;
+            SwingUtilities.invokeLater(() -> {
+                chatTurns.add(new ChatTurn("Assistant", reply));
+                setChatBusy(false);
+                if (chatStatusLabel != null) {
+                    chatStatusLabel.setText("Ready — " + model);
+                }
+            });
+            appendDashboardActivity("Chat reply received — " + model);
+        }).exceptionally(ex -> {
+            String detail = formatExceptionChainForDashboard(ex);
+            final String errorText = "Error: " + detail;
+            SwingUtilities.invokeLater(() -> {
+                chatTurns.add(new ChatTurn("Assistant", errorText));
+                setChatBusy(false);
+                if (chatStatusLabel != null) {
+                    chatStatusLabel.setText("Error — see message above");
+                }
+            });
+            appendDashboardActivity("Chat failed — " + detail);
+            api.logging().logToError("AI Auditor chat failed: " + detail);
+            return null;
+        });
     }
 
     private void appendDashboardActivity(String line) {
@@ -1456,9 +2624,9 @@ private void createMainTab() {
 			int queued = threadPoolManager.getQueueSize();
 			int completed = completedTasksCounter.get();
 
-			activeTasksLabel.setText("Active Tasks: " + active);
-			queuedTasksLabel.setText("Queued Tasks: " + queued);
-			completedTasksLabel.setText("Completed Tasks: " + completed);
+			activeTasksLabel.setText("Active: " + active);
+			queuedTasksLabel.setText("Queued: " + queued);
+			completedTasksLabel.setText("Completed: " + completed);
 
 			// Visual feedback for active work
 			if (active > 0) {
@@ -2006,7 +3174,8 @@ private void createMainTab() {
                 + "- Propose **2–4 concrete variants** where useful (e.g. different encodings, alternative parameters, CL.TE vs TE.CL style angles for smuggling-adjacent cases, error-based vs blind SQLi, polyglot XSS).\n"
                 + "- If the issue class needs **multiple requests** (login → abuse session → escalate), show that chain explicitly.\n\n"
                 + "## 3. What to observe\n"
-                + "Exact signals: status codes, body substrings, timing deltas, length differences, header anomalies—what **proves** success vs noise.\n\n"
+                + "Exact signals: status codes, body substrings, timing deltas, length differences, header anomalies—what **proves** success vs noise. "
+                + "Be specific (e.g. script tag present, payload reflected, error string, Set-Cookie change) — AI Auditor will send your HTTP blocks and check live responses against these signals.\n\n"
                 + "## 4. If you cannot build a solid PoC\n"
                 + "Say so clearly. List **specific** missing data (e.g. second role’s session, POST body schema, upstream proxy behavior) and the **next capture** the tester should take in Burp.\n\n"
                 + "## 5. Safety\n"
@@ -2202,6 +3371,7 @@ private void createMainTab() {
             JSONObject root = new JSONObject(sb.toString());
             JSONArray data = root.optJSONArray("data");
             if (data == null) {
+                cachedLocalModelIdsFromServer = new ArrayList<>();
                 return out;
             }
             for (int i = 0; i < data.length(); i++) {
@@ -2214,6 +3384,7 @@ private void createMainTab() {
                     out.add(id);
                 }
             }
+            cachedLocalModelIdsFromServer = new ArrayList<>(out);
         } catch (Exception e) {
             log("Could not list local LLM models (" + endpoint + "): " + e.getMessage(), LogCategory.GENERAL);
         } finally {
@@ -2274,7 +3445,23 @@ private void createMainTab() {
         for (String id : ordered) {
             defaultLocalModelCombo.addItem(id);
         }
-        setDefaultLocalModelComboText(previous);
+        boolean previousOnServer = false;
+        if (fromServer != null && previous != null && !previous.isEmpty()) {
+            for (String id : fromServer) {
+                if (previous.equals(id) || stripLocalProviderPrefix(previous).equals(id)) {
+                    previousOnServer = true;
+                    break;
+                }
+            }
+        }
+        if (!previousOnServer && fromServer != null && !fromServer.isEmpty()) {
+            String pick = fromServer.get(0);
+            setDefaultLocalModelComboText(pick);
+            log("Local LLM model id set to \"" + pick + "\" from /v1/models (previous \"" + previous
+                    + "\" is not loaded on that server).", LogCategory.GENERAL);
+        } else {
+            setDefaultLocalModelComboText(previous);
+        }
         if (fromServer != null && !fromServer.isEmpty()) {
             log("Local LLM model id list updated (" + fromServer.size() + " from /v1/models).", LogCategory.GENERAL);
         }
@@ -2501,6 +3688,16 @@ private void createMainTab() {
             JMenuItem genPoc = new JMenuItem("AI Auditor > Investigate — PoC / exploitation (LLM)");
             genPoc.addActionListener(e -> handleGeneratePocFromTraffic(reqRes));
             aiAuditorMenu.add(genPoc);
+
+            JMenuItem sendToChat = new JMenuItem("AI Auditor > Send to Chat");
+            sendToChat.addActionListener(e -> attachTrafficToChat(reqRes, null));
+            aiAuditorMenu.add(sendToChat);
+
+            if (selectionRange.isPresent()) {
+                JMenuItem sendSelectionToChat = new JMenuItem("AI Auditor > Send selection to Chat");
+                sendSelectionToChat.addActionListener(e -> attachTrafficToChat(reqRes, extractSelectedEditorText(editor)));
+                aiAuditorMenu.add(sendSelectionToChat);
+            }
         });
 
         // Handle Proxy History / Site Map selection
@@ -2514,21 +3711,23 @@ private void createMainTab() {
                 JMenuItem pocItem = new JMenuItem("Investigate — PoC / exploitation (LLM)");
                 pocItem.addActionListener(e -> handleGeneratePocFromTraffic(one));
                 aiAuditorMenu.add(pocItem);
+                JMenuItem sendToChat = new JMenuItem("Send to Chat");
+                sendToChat.addActionListener(e -> attachTrafficToChat(one, null));
+                aiAuditorMenu.add(sendToChat);
             } else {
                 JMenuItem scanMultiple = new JMenuItem(String.format("Scan %d Requests", selectedItems.size()));
                 scanMultiple.addActionListener(e -> handleMultipleScan(selectedItems));
                 aiAuditorMenu.add(scanMultiple);
+                JMenuItem sendMultipleToChat = new JMenuItem(String.format("Send first of %d requests to Chat", selectedItems.size()));
+                sendMultipleToChat.addActionListener(e -> attachTrafficToChat(selectedItems.get(0),
+                        selectedItems.size() + " requests were selected; the first is attached."));
+                aiAuditorMenu.add(sendMultipleToChat);
             }
         }
 
         List<AuditIssue> selectedIssues = getSelectedIssuesFromContextMenu(event);
         if (!selectedIssues.isEmpty()) {
-            List<AuditIssue> issuesCopy = new ArrayList<>(selectedIssues);
-            JMenuItem genPocIssues = new JMenuItem(selectedIssues.size() == 1
-                    ? "Investigate finding — PoC / exploitation (LLM)"
-                    : String.format("Investigate %d findings — PoC / exploitation (LLM)", selectedIssues.size()));
-            genPocIssues.addActionListener(e -> handleScannerIssuesGeneratePoc(issuesCopy));
-            aiAuditorMenu.add(genPocIssues);
+            addAuditIssueMenuItems(aiAuditorMenu, selectedIssues);
         }
         
         // Only add the AI Auditor menu if it has sub-items
@@ -2540,13 +3739,273 @@ private void createMainTab() {
     }
 
     /**
+     * Burp invokes this when the user right-clicks in Target → Issues (and similar audit-issue views).
+     * The generic {@link ContextMenuEvent} path does not receive issue selections from those views.
+     */
+    @Override
+    public List<Component> provideMenuItems(AuditIssueContextMenuEvent event) {
+        List<AuditIssue> selectedIssues = event.selectedIssues();
+        if (selectedIssues == null || selectedIssues.isEmpty()) {
+            return Collections.emptyList();
+        }
+        JMenu aiAuditorMenu = new JMenu("AI Auditor");
+        addAuditIssueMenuItems(aiAuditorMenu, selectedIssues);
+        return List.of(aiAuditorMenu);
+    }
+
+    private void addAuditIssueMenuItems(JMenu menu, List<AuditIssue> selectedIssues) {
+        List<AuditIssue> issuesCopy = new ArrayList<>(selectedIssues);
+        int count = selectedIssues.size();
+        JMenuItem genPocIssues = new JMenuItem(count == 1
+                ? "Investigate finding — PoC / exploitation (LLM)"
+                : String.format("Investigate %d findings — PoC / exploitation (LLM)", count));
+        genPocIssues.addActionListener(e -> handleScannerIssuesGeneratePoc(issuesCopy));
+        menu.add(genPocIssues);
+
+        JMenuItem deepDiveIssues = new JMenuItem(count == 1
+                ? "Deep-dive finding — AI analysis (LLM)"
+                : String.format("Deep-dive %d findings — AI analysis (LLM)", count));
+        deepDiveIssues.addActionListener(e -> handleScannerIssuesDeepDive(issuesCopy));
+        menu.add(deepDiveIssues);
+
+        JMenuItem sendIssuesToChat = new JMenuItem(count == 1
+                ? "Send finding to Chat"
+                : String.format("Send %d findings to Chat", count));
+        sendIssuesToChat.addActionListener(e -> attachIssuesToChat(issuesCopy));
+        menu.add(sendIssuesToChat);
+    }
+
+    /**
      * Burp still exposes scanner-issue context through {@link ContextMenuEvent#selectedIssues()} (deprecated but
-     * functional). Used for one-click deep-dive from issues raised by extensions such as HTTP Request Smuggler.
+     * functional). Used as a fallback when issues are selected outside the dedicated audit-issue context menu.
      */
     @SuppressWarnings("deprecation")
     private static List<AuditIssue> getSelectedIssuesFromContextMenu(ContextMenuEvent event) {
         List<AuditIssue> issues = event.selectedIssues();
         return issues != null ? issues : Collections.emptyList();
+    }
+
+    /**
+     * Resolves HTTP traffic for a Scanner issue: linked request/response pairs first, then site map lookup by base URL.
+     */
+    private List<HttpRequestResponse> resolveTrafficForIssue(AuditIssue issue) {
+        if (issue == null) {
+            return Collections.emptyList();
+        }
+        List<HttpRequestResponse> linked = issue.requestResponses();
+        if (linked != null && !linked.isEmpty()) {
+            List<HttpRequestResponse> valid = new ArrayList<>();
+            for (HttpRequestResponse rr : linked) {
+                if (rr != null && rr.request() != null) {
+                    valid.add(rr);
+                }
+            }
+            if (!valid.isEmpty()) {
+                return valid;
+            }
+        }
+        String baseUrl = issue.baseUrl();
+        if (baseUrl != null && !baseUrl.isEmpty()) {
+            try {
+                List<HttpRequestResponse> fromSiteMap = api.siteMap().requestResponses(SiteMapFilter.prefixFilter(baseUrl));
+                List<HttpRequestResponse> valid = new ArrayList<>();
+                for (HttpRequestResponse rr : fromSiteMap) {
+                    if (rr != null && rr.request() != null) {
+                        valid.add(rr);
+                    }
+                }
+                if (!valid.isEmpty()) {
+                    log("Resolved " + valid.size() + " site map request(s) for issue \"" + issue.name()
+                            + "\" via baseUrl " + baseUrl, LogCategory.GENERAL);
+                    return valid;
+                }
+            } catch (Exception e) {
+                log("Site map lookup failed for issue baseUrl " + baseUrl + ": " + e.getMessage(), LogCategory.GENERAL);
+            }
+        }
+        return Collections.emptyList();
+    }
+
+    /**
+     * Best-effort anchor for issues without linked messages (e.g. extension JS library findings).
+     * Burp's Site Map rejects issues with null httpService and empty requestResponses.
+     */
+    private HttpRequestResponse resolveAnchorRequestResponse(AuditIssue issue) {
+        if (issue == null) {
+            return null;
+        }
+        List<HttpRequestResponse> rrs = resolveTrafficForIssue(issue);
+        if (!rrs.isEmpty()) {
+            return rrs.get(0);
+        }
+        String baseUrl = issue.baseUrl();
+        if (baseUrl != null && !baseUrl.isEmpty()) {
+            HttpRequestResponse fetched = fetchAnchorFromUrl(baseUrl);
+            if (fetched != null) {
+                return fetched;
+            }
+            int lastSlash = baseUrl.lastIndexOf('/');
+            if (lastSlash > 8) {
+                String parentPrefix = baseUrl.substring(0, lastSlash + 1);
+                try {
+                    for (HttpRequestResponse rr : api.siteMap().requestResponses(SiteMapFilter.prefixFilter(parentPrefix))) {
+                        if (rr != null && rr.request() != null) {
+                            log("Resolved anchor via parent prefix " + parentPrefix, LogCategory.GENERAL);
+                            return rr;
+                        }
+                    }
+                } catch (Exception e) {
+                    log("Parent-prefix site map lookup failed for " + parentPrefix + ": " + e.getMessage(), LogCategory.GENERAL);
+                }
+            }
+        }
+        HttpService svc = issue.httpService();
+        if (svc != null && baseUrl != null && !baseUrl.isEmpty()) {
+            try {
+                HttpRequest req = HttpRequest.httpRequest(svc, HttpRequest.httpRequestFromUrl(baseUrl).toString());
+                return api.http().sendRequest(req);
+            } catch (Exception e) {
+                log("Anchor fetch with issue httpService failed: " + e.getMessage(), LogCategory.GENERAL);
+            }
+        }
+        return null;
+    }
+
+    private HttpRequestResponse fetchAnchorFromUrl(String url) {
+        try {
+            HttpRequest req = HttpRequest.httpRequestFromUrl(url);
+            HttpRequestResponse rr = api.http().sendRequest(req);
+            if (rr != null && rr.request() != null) {
+                log("Fetched anchor HTTP traffic for " + url, LogCategory.GENERAL);
+                return rr;
+            }
+        } catch (Exception e) {
+            log("Could not fetch anchor for " + url + ": " + e.getMessage(), LogCategory.GENERAL);
+        }
+        return null;
+    }
+
+    /**
+     * Validates Premium Model for PoCs and API key before manual investigation. Returns resolved model id, or null.
+     */
+    private String validateManualInvestigationModelPreflight(String actionLabel) {
+        String selectedModel = getManualInvestigationModel();
+        if ("Default".equals(selectedModel)) {
+            api.logging().raiseErrorEvent(
+                    "AI Auditor: Premium Model for PoCs is \"Default\" and no provider could be inferred. "
+                            + "On Connect: enter your xAI/Grok key, click Get Latest Models, pick xai/grok-… under "
+                            + "Premium Model for PoCs, then Save Settings.");
+            appendDashboardActivity(actionLabel + " blocked — no model configured");
+            return null;
+        }
+        String[] modelParts = selectedModel.split("/", 2);
+        String provider = modelParts.length == 2 ? modelParts[0] : "";
+        if ("local".equals(provider)) {
+            if (localEndpointField.getText().trim().isEmpty()) {
+                api.logging().raiseErrorEvent("AI Auditor: Local LLM endpoint not configured.");
+                appendDashboardActivity(actionLabel + " blocked — local endpoint missing");
+                return null;
+            }
+        } else {
+            String apiKey = getApiKeyForModel(selectedModel);
+            if (apiKey == null || apiKey.isEmpty()) {
+                String keyHint = "xai".equals(provider)
+                        ? "AI Auditor: xAI (Grok) API key missing. Connect tab → enter key → Validate → Save Settings."
+                        : "AI Auditor: API key not configured for " + selectedModel + ". Connect tab → Save Settings.";
+                api.logging().raiseErrorEvent(keyHint);
+                appendDashboardActivity(actionLabel + " blocked — API key missing for " + provider);
+                return null;
+            }
+        }
+        api.logging().raiseInfoEvent("AI Auditor: " + actionLabel + " using model " + selectedModel);
+        return selectedModel;
+    }
+
+    private boolean isLocalLlmEndpointConfigured() {
+        return localEndpointField != null && !localEndpointField.getText().trim().isEmpty();
+    }
+
+    private String normalizeLocalLlmBaseUrl() {
+        String base = localEndpointField != null ? localEndpointField.getText().trim() : "";
+        if (base.isEmpty()) {
+            return "";
+        }
+        return base.replaceAll("/+$", "");
+    }
+
+    private static String stripLocalProviderPrefix(String id) {
+        if (id == null) {
+            return "";
+        }
+        String trimmed = id.trim();
+        if (trimmed.regionMatches(true, 0, "local/", 0, 6)) {
+            return trimmed.substring(6).trim();
+        }
+        return trimmed;
+    }
+
+    private boolean isLocalModelIdOnServer(String modelId, List<String> fromServer) {
+        if (modelId == null || modelId.isEmpty() || fromServer == null || fromServer.isEmpty()) {
+            return false;
+        }
+        String want = stripLocalProviderPrefix(modelId);
+        for (String id : fromServer) {
+            if (id != null && (want.equals(id) || want.equalsIgnoreCase(id))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Chat prefers the local LLM whenever a Local LLM URL is set; otherwise Premium Model for PoCs.
+     */
+    private String resolveChatModel() {
+        if (isLocalLlmEndpointConfigured()) {
+            String id = getDefaultLocalModelComboText();
+            if (id != null && !id.isEmpty() && !id.equalsIgnoreCase(LEGACY_LOCAL_MODEL_PLACEHOLDER)) {
+                return id.startsWith("local/") ? id : "local/" + id;
+            }
+            String auto = getAutomaticAuditModel();
+            if (auto != null && auto.startsWith("local/") && auto.length() > "local/".length()) {
+                return auto;
+            }
+            return cachedDefaultLocal != null && !cachedDefaultLocal.isEmpty()
+                    ? cachedDefaultLocal
+                    : "local/gemma4:e4b";
+        }
+        return getManualInvestigationModel();
+    }
+
+    private String validateChatModelPreflight() {
+        String selectedModel = resolveChatModel();
+        if (selectedModel == null || selectedModel.trim().isEmpty() || "Default".equals(selectedModel)) {
+            api.logging().raiseErrorEvent(
+                    "AI Auditor Chat: no model available. Set Local LLM URL and Local LLM model id on Connect, "
+                            + "or pick Premium Model for PoCs as a cloud fallback, then Save Settings.");
+            appendDashboardActivity("Chat blocked — no local LLM or premium model configured");
+            return null;
+        }
+        String[] modelParts = selectedModel.split("/", 2);
+        String provider = modelParts.length == 2 ? modelParts[0] : "";
+        if ("local".equals(provider)) {
+            if (!isLocalLlmEndpointConfigured()) {
+                api.logging().raiseErrorEvent("AI Auditor Chat: Local LLM URL is empty.");
+                appendDashboardActivity("Chat blocked — local endpoint missing");
+                return null;
+            }
+        } else {
+            String apiKey = getApiKeyForModel(selectedModel);
+            if (apiKey == null || apiKey.isEmpty()) {
+                api.logging().raiseErrorEvent(
+                        "AI Auditor Chat: no local LLM configured, and API key missing for fallback model "
+                                + selectedModel + ". Connect tab → Local LLM URL or cloud key → Save Settings.");
+                appendDashboardActivity("Chat blocked — API key missing for " + provider);
+                return null;
+            }
+        }
+        api.logging().raiseInfoEvent("AI Auditor: Chat using model " + selectedModel);
+        return selectedModel;
     }
 
     private String buildScannerIssueDeepDivePreamble(AuditIssue issue) {
@@ -2572,29 +4031,42 @@ private void createMainTab() {
 
     private void handleScannerIssuesDeepDive(List<AuditIssue> issues) {
         if (issues == null || issues.isEmpty()) {
+            api.logging().raiseInfoEvent("AI Auditor: Deep-dive requested but no issues were selected.");
+            return;
+        }
+        api.logging().raiseInfoEvent("AI Auditor: starting deep-dive analysis for " + issues.size() + " issue(s)…");
+        appendDashboardActivity("Deep-dive requested — " + issues.size() + " issue(s)");
+        String model = validateManualInvestigationModelPreflight("Deep-dive");
+        if (model == null) {
             return;
         }
         int queued = 0;
+        int metadataOnly = 0;
         for (AuditIssue issue : issues) {
             String preamble = buildScannerIssueDeepDivePreamble(issue);
-            List<HttpRequestResponse> rrs = issue.requestResponses();
-            if (rrs == null || rrs.isEmpty()) {
-                log("Deep-dive: issue \"" + issue.name() + "\" has no linked HTTP messages; skip or open the issue in the editor.",
+            List<HttpRequestResponse> rrs = resolveTrafficForIssue(issue);
+            if (rrs.isEmpty()) {
+                log("Deep-dive: issue \"" + issue.name() + "\" has no linked HTTP messages; running metadata-only analysis.",
                         LogCategory.GENERAL);
+                api.logging().raiseInfoEvent(
+                        "AI Auditor: issue \"" + truncateForIssueTitle(issue.name(), 80)
+                                + "\" has no stored HTTP traffic — deep-dive will use issue metadata only.");
+                processAuditRequest(null, null, false, preamble, false);
+                queued++;
+                metadataOnly++;
                 continue;
             }
             for (HttpRequestResponse rr : rrs) {
-                if (rr != null && rr.request() != null) {
-                    processAuditRequest(rr, null, false, preamble, false);
-                    queued++;
-                }
+                processAuditRequest(rr, null, false, preamble, false);
+                queued++;
             }
         }
         if (queued == 0) {
             api.logging().raiseInfoEvent(
-                    "AI Auditor: Selected issue(s) have no linked HTTP traffic. Open the request in Proxy/Logger and use Scan Request/Response, or pick an issue that includes stored requests.");
+                    "AI Auditor: Could not queue deep-dive for the selected issue(s). Check Connect tab model and API key.");
         } else {
-            log("Deep-dive queued " + queued + " AI audit run(s) for Scanner issue(s).", LogCategory.GENERAL);
+            log("Deep-dive queued " + queued + " AI audit run(s) for Scanner issue(s)"
+                    + (metadataOnly > 0 ? " (" + metadataOnly + " metadata-only)" : "") + ".", LogCategory.GENERAL);
             appendDashboardActivity("Scanner issue deep-dive queued — " + queued + " AI audit run(s)");
         }
     }
@@ -2715,34 +4187,61 @@ private void createMainTab() {
 
     private void handleScannerIssuesGeneratePoc(List<AuditIssue> issues) {
         if (issues == null || issues.isEmpty()) {
+            api.logging().raiseInfoEvent("AI Auditor: PoC investigation requested but no issues were selected.");
+            return;
+        }
+        api.logging().raiseInfoEvent("AI Auditor: starting PoC investigation for " + issues.size() + " issue(s)…");
+        appendDashboardActivity("PoC investigation requested — " + issues.size() + " issue(s)");
+        if (validateManualInvestigationModelPreflight("PoC investigation") == null) {
             return;
         }
         int queued = 0;
+        int metadataOnly = 0;
         for (AuditIssue issue : issues) {
             String issueCtx = buildScannerIssuePocContext(issue);
-            List<HttpRequestResponse> rrs = issue.requestResponses();
-            if (rrs == null || rrs.isEmpty()) {
-                log("Generate PoC: issue \"" + issue.name() + "\" has no linked HTTP messages.", LogCategory.GENERAL);
+            List<HttpRequestResponse> rrs = resolveTrafficForIssue(issue);
+            if (rrs.isEmpty()) {
+                HttpRequestResponse anchor = resolveAnchorRequestResponse(issue);
+                String evidence;
+                if (anchor != null && anchor.request() != null) {
+                    String traffic = anchor.request().toString()
+                            + "\n\n"
+                            + (anchor.response() != null ? anchor.response().toString() : "(no response captured)");
+                    evidence = issueCtx + "\n\n=== HTTP traffic (anchor fetch for asset URL) ===\n\n" + traffic;
+                    log("Generate PoC: anchored issue \"" + issue.name() + "\" via asset URL fetch.", LogCategory.GENERAL);
+                } else {
+                    log("Generate PoC: issue \"" + issue.name() + "\" has no linked HTTP messages; running metadata-only investigation.",
+                            LogCategory.GENERAL);
+                    api.logging().raiseInfoEvent(
+                            "AI Auditor: issue \"" + truncateForIssueTitle(issue.name(), 80)
+                                    + "\" has no stored HTTP traffic — PoC will use issue metadata only.");
+                    evidence = issueCtx + "\n\n[NOTE: No HTTP traffic was linked to this issue. "
+                            + "Analysis is based on issue metadata only — verification steps may be limited.]";
+                }
+                String title = "AI investigate / PoC: " + truncateForIssueTitle(issue.name(), 100);
+                runPocAsync(anchor, evidence, title, true, issue);
+                queued++;
+                if (anchor == null) {
+                    metadataOnly++;
+                }
                 continue;
             }
             for (HttpRequestResponse rr : rrs) {
-                if (rr != null && rr.request() != null) {
-                    String traffic = rr.request().toString()
-                            + "\n\n"
-                            + (rr.response() != null ? rr.response().toString() : "(no response captured)");
-                    String evidence = issueCtx + "\n\n=== HTTP traffic (request then response) ===\n\n" + traffic;
-                    String title = "AI investigate / PoC: " + truncateForIssueTitle(issue.name(), 100);
-                    // From Scanner issue context, avoid creating a second "informational" issue entry.
-                    runPocAsync(rr, evidence, title, true, issue);
-                    queued++;
-                }
+                String traffic = rr.request().toString()
+                        + "\n\n"
+                        + (rr.response() != null ? rr.response().toString() : "(no response captured)");
+                String evidence = issueCtx + "\n\n=== HTTP traffic (request then response) ===\n\n" + traffic;
+                String title = "AI investigate / PoC: " + truncateForIssueTitle(issue.name(), 100);
+                runPocAsync(rr, evidence, title, true, issue);
+                queued++;
             }
         }
         if (queued == 0) {
             api.logging().raiseInfoEvent(
-                    "AI Auditor: No linked HTTP traffic on the selected issue(s). Use Generate PoC from Proxy/Logger on the raw message instead.");
+                    "AI Auditor: Could not queue PoC for the selected issue(s). Check Connect tab model and API key.");
         } else {
-            log("Generate PoC queued " + queued + " LLM run(s).", LogCategory.GENERAL);
+            log("Generate PoC queued " + queued + " LLM run(s)"
+                    + (metadataOnly > 0 ? " (" + metadataOnly + " metadata-only)" : "") + ".", LogCategory.GENERAL);
             appendDashboardActivity("PoC generation queued — " + queued + " LLM run(s) from Scanner issue(s)");
         }
     }
@@ -2763,23 +4262,11 @@ private void createMainTab() {
      * When {@code addAsNewIssue} is false, the result is logged for review instead of creating a new Site Map issue.
      */
     private void runPocAsync(HttpRequestResponse rr, String evidenceBlock, String issueName, boolean addAsNewIssue, AuditIssue sourceIssueForReplacement) {
-        String selectedModel = getManualInvestigationModel();
-        if ("Default".equals(selectedModel)) {
-            api.logging().raiseErrorEvent("AI Auditor: Choose a model (not \"Default\") or configure API keys before generating a PoC.");
+        String selectedModel = validateManualInvestigationModelPreflight("PoC / investigation");
+        if (selectedModel == null) {
             return;
         }
         String apiKey = getApiKeyForModel(selectedModel);
-        String[] modelParts = selectedModel.split("/", 2);
-        String provider = modelParts.length == 2 ? modelParts[0] : "";
-        if ("local".equals(provider)) {
-            if (localEndpointField.getText().trim().isEmpty()) {
-                api.logging().raiseErrorEvent("Local LLM endpoint not configured.");
-                return;
-            }
-        } else if (apiKey == null || apiKey.isEmpty()) {
-            api.logging().raiseErrorEvent("API key not configured for the selected model.");
-            return;
-        }
 
         String instructions = pocPromptArea != null ? pocPromptArea.getText() : null;
         if (instructions == null || instructions.trim().isEmpty()) {
@@ -2815,11 +4302,26 @@ private void createMainTab() {
                 text = "(No text extracted from model response. Check Extension output / logging level for raw API output.)";
             }
             boolean likelyFalsePositive = looksLikeFalsePositiveVerdict(text);
-            String autoExecutionSummary = likelyFalsePositive
-                    ? "\n\n---\nAuto-execution skipped: investigation text suggests a possible false positive (verify with another model or manual PoC before closing)."
+            PocAutoExecutionResult execResult = likelyFalsePositive
+                    ? PocAutoExecutionResult.skipped("investigation text suggests a possible false positive")
                     : executeGeneratedPocRequests(text, reqRes);
+            String autoExecutionSummary = execResult.toMarkdownSummary();
+            String verificationSection = "";
+            if (!likelyFalsePositive && execResult.hasResponseBodies()) {
+                appendDashboardActivity("PoC verification — analyzing HTTP response bodies…");
+                try {
+                    String verification = verifyPocExecutionsWithModel(text, execResult, model, key);
+                    if (verification != null && !verification.trim().isEmpty()) {
+                        verificationSection = "\n\n---\n\n## PoC response verification (live traffic)\n\n" + verification.trim();
+                    }
+                } catch (Exception verifyEx) {
+                    verificationSection = "\n\n---\n\n## PoC response verification (live traffic)\n\n"
+                            + "Verification call failed: " + verifyEx.getMessage();
+                    log("PoC response verification failed: " + verifyEx.getMessage(), LogCategory.GENERAL);
+                }
+            }
             String detail = "**AI investigation (PoC / exploitation)** — same *intent* as Burp’s built-in “dig into finding”; you chose the model. Models can be wrong.\n\n"
-                    + text + autoExecutionSummary;
+                    + text + autoExecutionSummary + verificationSection;
             if (shouldAddIssue) {
                 String finalIssueName = findingName;
                 AuditIssueSeverity finalSeverity = AuditIssueSeverity.INFORMATION;
@@ -2839,18 +4341,47 @@ private void createMainTab() {
                                 + detail;
                     }
                 }
+                HttpRequestResponse anchorRr = reqRes;
+                if ((anchorRr == null || anchorRr.request() == null) && replacementSourceIssue != null) {
+                    anchorRr = resolveAnchorRequestResponse(replacementSourceIssue);
+                }
+                String endpoint;
+                List<HttpRequestResponse> issueRrs;
+                if (anchorRr != null && anchorRr.request() != null) {
+                    endpoint = anchorRr.request().url().toString();
+                    issueRrs = Collections.singletonList(anchorRr);
+                } else if (replacementSourceIssue != null && replacementSourceIssue.baseUrl() != null) {
+                    endpoint = replacementSourceIssue.baseUrl();
+                    issueRrs = Collections.emptyList();
+                } else {
+                    endpoint = "unknown";
+                    issueRrs = Collections.emptyList();
+                }
+                if (issueRrs.isEmpty()) {
+                    api.logging().logToOutput("AI Auditor investigation result for \"" + finalIssueName + "\":\n" + detail);
+                    api.logging().raiseInfoEvent(
+                            "AI Auditor: PoC complete — no HTTP anchor for Site Map. Full result is in Extension Output.");
+                    appendDashboardActivity("PoC / investigation finished — result in Extension Output (no HTTP anchor)");
+                    return;
+                }
                 AIAuditIssue issue = new AIAuditIssue.Builder()
                         .name(finalIssueName)
                         .detail(detail)
-                        .endpoint(reqRes.request().url().toString())
+                        .endpoint(endpoint)
                         .severity(finalSeverity)
                         .confidence(finalConfidence)
-                        .requestResponses(Collections.singletonList(reqRes))
+                        .requestResponses(issueRrs)
                         .modelUsed(model)
                         .build();
-                api.siteMap().add(issue);
-                log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
-                appendDashboardActivity("PoC / investigation finished — notes added to Site Map");
+                try {
+                    api.siteMap().add(issue);
+                    log("PoC / exploitation notes added to Site Map.", LogCategory.GENERAL);
+                    appendDashboardActivity("PoC / investigation finished — notes added to Site Map");
+                } catch (Exception addEx) {
+                    api.logging().logToOutput("AI Auditor investigation result for \"" + finalIssueName + "\":\n" + detail);
+                    showError("PoC notes could not be added to Site Map; result saved to Extension Output", addEx);
+                    appendDashboardActivity("PoC / investigation finished — Site Map add failed; see Extension Output");
+                }
             } else {
                 log("PoC / exploitation notes generated (no issue creation): "
                         + truncateForIssueTitle(findingName, 120), LogCategory.GENERAL);
@@ -2915,20 +4446,141 @@ private void createMainTab() {
                 || t.contains("probably a false positive");
     }
 
-    private String executeGeneratedPocRequests(String aiText, HttpRequestResponse sourceRequestResponse) {
+    private static final class PocExecutionRecord {
+        final int index;
+        final String requestFirstLine;
+        final boolean sent;
+        final String sendError;
+        final int statusCode;
+        final String contentType;
+        final int responseBodyLength;
+        final String responseBodyPreview;
+        final List<String> heuristicHits;
+
+        PocExecutionRecord(int index, String requestFirstLine, boolean sent, String sendError,
+                int statusCode, String contentType, int responseBodyLength, String responseBodyPreview,
+                List<String> heuristicHits) {
+            this.index = index;
+            this.requestFirstLine = requestFirstLine;
+            this.sent = sent;
+            this.sendError = sendError;
+            this.statusCode = statusCode;
+            this.contentType = contentType;
+            this.responseBodyLength = responseBodyLength;
+            this.responseBodyPreview = responseBodyPreview;
+            this.heuristicHits = heuristicHits != null ? heuristicHits : Collections.emptyList();
+        }
+    }
+
+    private static final class PocAutoExecutionResult {
+        final List<PocExecutionRecord> records;
+        final String skipReason;
+
+        private PocAutoExecutionResult(List<PocExecutionRecord> records, String skipReason) {
+            this.records = records != null ? records : Collections.emptyList();
+            this.skipReason = skipReason;
+        }
+
+        static PocAutoExecutionResult skipped(String reason) {
+            return new PocAutoExecutionResult(Collections.emptyList(), reason);
+        }
+
+        boolean hasResponseBodies() {
+            for (PocExecutionRecord r : records) {
+                if (r.sent && r.responseBodyPreview != null && !r.responseBodyPreview.isEmpty()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        String toMarkdownSummary() {
+            if (skipReason != null && !skipReason.isEmpty()) {
+                return "\n\n---\nAuto-execution skipped: " + skipReason
+                        + " (verify with another model or manual PoC before closing).";
+            }
+            if (records.isEmpty()) {
+                return "\n\n---\nAuto-execution: No parseable raw HTTP requests found in the PoC output.";
+            }
+            StringBuilder sb = new StringBuilder("\n\n---\nAuto-execution summary:\n");
+            int sent = 0;
+            for (PocExecutionRecord r : records) {
+                if (r.sent) {
+                    sent++;
+                }
+                if (!r.sent) {
+                    sb.append(String.format("- Request %d: failed to send (%s).\n", r.index, r.sendError));
+                    continue;
+                }
+                sb.append(String.format("- Request %d (%s): HTTP %d", r.index, r.requestFirstLine, r.statusCode));
+                if (r.contentType != null && !r.contentType.isEmpty()) {
+                    sb.append(", Content-Type: ").append(r.contentType);
+                }
+                sb.append(String.format(", body length: %d bytes.\n", r.responseBodyLength));
+                if (!r.heuristicHits.isEmpty()) {
+                    sb.append("  Heuristic signals: ").append(String.join("; ", r.heuristicHits)).append("\n");
+                }
+                if (r.responseBodyPreview != null && !r.responseBodyPreview.isEmpty()) {
+                    sb.append("  Body preview:\n```\n").append(r.responseBodyPreview).append("\n```\n");
+                }
+            }
+            sb.append(String.format("Sent %d/%d request(s).", sent, records.size()));
+            return sb.toString();
+        }
+
+        String toVerificationEvidenceBlock(int maxTotalChars) {
+            StringBuilder sb = new StringBuilder();
+            int budget = maxTotalChars;
+            for (PocExecutionRecord r : records) {
+                if (!r.sent) {
+                    continue;
+                }
+                String block = formatRecordForVerification(r);
+                if (block.length() > budget) {
+                    if (budget > 256) {
+                        sb.append(block, 0, budget).append("\n... [truncated for verification prompt] ...\n");
+                    }
+                    break;
+                }
+                sb.append(block);
+                budget -= block.length();
+            }
+            return sb.toString();
+        }
+
+        private static String formatRecordForVerification(PocExecutionRecord r) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("### Request ").append(r.index).append(": ").append(r.requestFirstLine).append("\n");
+            sb.append("Status: ").append(r.statusCode).append("\n");
+            if (r.contentType != null && !r.contentType.isEmpty()) {
+                sb.append("Content-Type: ").append(r.contentType).append("\n");
+            }
+            sb.append("Body length: ").append(r.responseBodyLength).append(" bytes\n");
+            if (!r.heuristicHits.isEmpty()) {
+                sb.append("Heuristic signals: ").append(String.join("; ", r.heuristicHits)).append("\n");
+            }
+            if (r.responseBodyPreview != null && !r.responseBodyPreview.isEmpty()) {
+                sb.append("Response body preview:\n").append(r.responseBodyPreview).append("\n");
+            }
+            sb.append("\n");
+            return sb.toString();
+        }
+    }
+
+    private PocAutoExecutionResult executeGeneratedPocRequests(String aiText, HttpRequestResponse sourceRequestResponse) {
         List<String> requests = extractHttpRequestsFromMarkdown(aiText);
         if (requests.isEmpty()) {
-            return "\n\n---\nAuto-execution: No parseable raw HTTP requests found in the PoC output.";
+            return new PocAutoExecutionResult(Collections.emptyList(), null);
         }
 
         int cap = Math.min(MAX_AUTO_POC_REQUESTS, requests.size());
-        int sent = 0;
-        List<String> lines = new ArrayList<>();
+        List<PocExecutionRecord> records = new ArrayList<>();
         HttpService fallbackService = sourceRequestResponse != null && sourceRequestResponse.request() != null
                 ? sourceRequestResponse.request().httpService()
                 : null;
         for (int i = 0; i < cap; i++) {
             String rawRequest = requests.get(i);
+            String firstLine = rawRequest.lines().findFirst().orElse("(unknown request)");
             try {
                 HttpRequest req = HttpRequest.httpRequest(rawRequest);
                 if ((req.httpService() == null || req.httpService().host() == null || req.httpService().host().isEmpty())
@@ -2936,18 +4588,124 @@ private void createMainTab() {
                     req = HttpRequest.httpRequest(fallbackService, rawRequest);
                 }
                 HttpRequestResponse rr = api.http().sendRequest(req);
-                int status = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
-                lines.add(String.format("- Request %d: sent, HTTP %s.", i + 1, status >= 0 ? Integer.toString(status) : "no response"));
-                sent++;
+                HttpResponse resp = rr != null ? rr.response() : null;
+                int status = resp != null ? resp.statusCode() : -1;
+                String contentType = extractResponseContentType(resp);
+                String body = resp != null ? resp.bodyToString() : "";
+                int bodyLen = body != null ? body.length() : 0;
+                String preview = body != null && !body.isEmpty()
+                        ? truncateMiddleWithNotice(body, POC_RESPONSE_BODY_PREVIEW_CHARS)
+                        : "";
+                List<String> hits = analyzePocResponseHeuristics(rawRequest, body, status);
+                records.add(new PocExecutionRecord(i + 1, firstLine, true, null, status, contentType, bodyLen, preview, hits));
             } catch (Exception e) {
-                lines.add(String.format("- Request %d: failed to send (%s).", i + 1, e.getMessage()));
+                records.add(new PocExecutionRecord(i + 1, firstLine, false, e.getMessage(), -1, null, 0, "", Collections.emptyList()));
             }
         }
         if (requests.size() > cap) {
-            lines.add(String.format("- %d additional request(s) ignored due to cap (%d).", requests.size() - cap, MAX_AUTO_POC_REQUESTS));
+            log(String.format("Auto-execution: %d additional request(s) ignored due to cap (%d).",
+                    requests.size() - cap, MAX_AUTO_POC_REQUESTS), LogCategory.GENERAL);
         }
-        return "\n\n---\nAuto-execution summary:\n" + String.join("\n", lines)
-                + String.format("\nSent %d/%d request(s).", sent, cap);
+        return new PocAutoExecutionResult(records, null);
+    }
+
+    private static String extractResponseContentType(HttpResponse resp) {
+        if (resp == null) {
+            return "";
+        }
+        for (HttpHeader h : resp.headers()) {
+            if (h != null && "Content-Type".equalsIgnoreCase(h.name())) {
+                return h.value();
+            }
+        }
+        return "";
+    }
+
+    private List<String> analyzePocResponseHeuristics(String rawRequest, String responseBody, int statusCode) {
+        List<String> hits = new ArrayList<>();
+        if (responseBody == null || responseBody.isEmpty()) {
+            if (statusCode > 0) {
+                hits.add("empty response body");
+            }
+            return hits;
+        }
+        String bodyLower = responseBody.toLowerCase(Locale.ROOT);
+        if (bodyLower.contains("<script")) {
+            hits.add("<script tag present in response body");
+        }
+        if (bodyLower.contains("javascript:")) {
+            hits.add("javascript: URI present in response body");
+        }
+        if (bodyLower.contains("onerror=") || bodyLower.contains("onload=")) {
+            hits.add("inline event handler attribute present");
+        }
+        List<String> reflected = findReflectedPayloadFragments(rawRequest, responseBody);
+        for (String fragment : reflected) {
+            hits.add("request fragment reflected in body: \"" + truncateForIssueTitle(fragment, 80) + "\"");
+        }
+        return hits;
+    }
+
+    private List<String> findReflectedPayloadFragments(String rawRequest, String responseBody) {
+        List<String> reflected = new ArrayList<>();
+        if (rawRequest == null || responseBody == null || responseBody.isEmpty()) {
+            return reflected;
+        }
+        Set<String> candidates = new LinkedHashSet<>();
+        Matcher urlParam = Pattern.compile("[?&]([^=&]{4,})=").matcher(rawRequest);
+        while (urlParam.find()) {
+            candidates.add(urlParam.group(1));
+        }
+        Matcher urlValue = Pattern.compile("[?&][^=]+=([^&\\s\\r\\n]{4,})").matcher(rawRequest);
+        while (urlValue.find()) {
+            try {
+                candidates.add(java.net.URLDecoder.decode(urlValue.group(1), StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                candidates.add(urlValue.group(1));
+            }
+        }
+        int bodyStart = rawRequest.indexOf("\r\n\r\n");
+        if (bodyStart < 0) {
+            bodyStart = rawRequest.indexOf("\n\n");
+        }
+        if (bodyStart >= 0 && bodyStart + 4 < rawRequest.length()) {
+            String reqBody = rawRequest.substring(bodyStart).trim();
+            if (reqBody.length() >= 4 && reqBody.length() <= 512) {
+                candidates.add(reqBody);
+            }
+        }
+        for (String c : candidates) {
+            if (c.length() >= 4 && responseBody.contains(c) && reflected.size() < 5) {
+                reflected.add(c);
+            }
+        }
+        return reflected;
+    }
+
+    private String verifyPocExecutionsWithModel(String pocProposalText, PocAutoExecutionResult execution,
+            String model, String apiKey) throws Exception {
+        String evidence = execution.toVerificationEvidenceBlock(POC_VERIFY_TOTAL_RESPONSE_CHARS);
+        if (evidence.isEmpty()) {
+            return "";
+        }
+        String prompt = "You previously proposed a penetration-test PoC. The operator executed your raw HTTP request(s) through Burp. "
+                + "Using YOUR proposed success criteria (especially section 3 — what to observe) and the ACTUAL responses below, "
+                + "decide whether the exploit/PoC is working.\n\n"
+                + "OUTPUT — Markdown only:\n"
+                + "## Verdict\n"
+                + "One of: **CONFIRMED** | **LIKELY** | **INCONCLUSIVE** | **NOT_WORKING**\n\n"
+                + "## Evidence from responses\n"
+                + "- Quote specific substrings, headers, or status/length deltas from the live responses.\n"
+                + "- For XSS/script injection: state clearly whether a script or payload appears in the HTML/JS response (and where).\n"
+                + "- For SQLi/command injection: cite error strings, timing, or content changes.\n\n"
+                + "## Next step\n"
+                + "If not confirmed: one concrete next request or capture to try.\n\n"
+                + "---\n## Your proposed PoC\n\n"
+                + pocProposalText
+                + "\n\n---\n## Live execution results\n\n"
+                + evidence;
+        JSONObject resp = sendToAI(model, apiKey, prompt, false);
+        return extractContentFromResponse(resp, model);
     }
 
     private List<String> extractHttpRequestsFromMarkdown(String text) {
@@ -3173,6 +4931,7 @@ private void createMainTab() {
             return;
         }
     
+        ExecutorService auditExecutor = threadPoolManager != null ? threadPoolManager.getExecutor() : null;
         CompletableFuture.runAsync(() -> {
             try {
                 String prompt = promptTemplateArea.getText();
@@ -3187,13 +4946,20 @@ private void createMainTab() {
 
                 if (isSelectedPortion && selectedContent != null) {
                     contentToChunk = selectedContent;
-                } else {
+                } else if (reqRes != null && reqRes.request() != null) {
                     request = reqRes.request().toString();
                     response = reqRes.response() != null ? reqRes.response().toString() : "";
                     contentToChunk = request + "\n\n" + response;
-                }
-                if (preamble != null && !preamble.isEmpty()) {
-                    contentToChunk = preamble + "\n\n=== HTTP traffic (request then response) ===\n\n" + contentToChunk;
+                    if (preamble != null && !preamble.isEmpty()) {
+                        contentToChunk = preamble + "\n\n=== HTTP traffic (request then response) ===\n\n" + contentToChunk;
+                    }
+                } else if (preamble != null && !preamble.isEmpty()) {
+                    contentToChunk = preamble + "\n\n[NOTE: No HTTP traffic was linked to this issue. "
+                            + "Analysis is based on issue metadata only — verification steps may be limited.]";
+                    api.logging().raiseInfoEvent("AI Auditor: deep-dive running on metadata only (no linked HTTP traffic).");
+                } else {
+                    api.logging().raiseInfoEvent("Skipping audit for empty request/response content.");
+                    return;
                 }
 
                 log(String.format("processAuditRequest - Request length: %d, Response length: %d, Combined contentToChunk length: %d",
@@ -3254,7 +5020,7 @@ private void createMainTab() {
                 showError("Error processing request (Model:" + selectedModel + ")= " , e);
             }
 
-        }).exceptionally(e -> {
+        }, auditExecutor != null ? auditExecutor : ForkJoinPool.commonPool()).exceptionally(e -> {
             api.logging().logToError("Critical error in request processing: " + e.getMessage());
             showError("Critical error", e);
             return null;
@@ -3273,23 +5039,31 @@ private void createMainTab() {
      */
     private String resolveOpenAiCompatibleLocalModelId(String dropdownModelSuffix) throws IllegalArgumentException {
         String legacy = LEGACY_LOCAL_MODEL_PLACEHOLDER;
-        String fromField = getDefaultLocalModelComboText();
+        String fromField = stripLocalProviderPrefix(getDefaultLocalModelComboText());
+        String fromDropdown = stripLocalProviderPrefix(dropdownModelSuffix);
+        String resolved = "";
         if (!fromField.isEmpty() && !fromField.equalsIgnoreCase(legacy)) {
-            if (fromField.contains("/")) {
-                fromField = fromField.substring(fromField.indexOf('/') + 1).trim();
-            }
-            if (!fromField.isEmpty() && !fromField.equalsIgnoreCase(legacy)) {
-                return fromField;
-            }
+            resolved = fromField;
+        } else if (!fromDropdown.isEmpty() && !fromDropdown.equalsIgnoreCase(legacy)) {
+            resolved = fromDropdown;
         }
-        String fromDropdown = dropdownModelSuffix != null ? dropdownModelSuffix.trim() : "";
-        if (!fromDropdown.isEmpty() && !fromDropdown.equalsIgnoreCase(legacy)) {
-            return fromDropdown;
+        if (resolved.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "AI Auditor: On Connect → Models, set \"Local LLM model id\" to your server's OpenAI `model` id "
+                            + "(Ollama: use a name from `ollama list` on that host). The old label \"" + legacy
+                            + "\" is not a valid model id for Ollama.");
         }
-        throw new IllegalArgumentException(
-                "AI Auditor: On Connect → Models, set \"Local LLM model id\" to your server's OpenAI `model` id "
-                        + "(Ollama: use a name from `ollama list` on that host). The old label \"" + legacy
-                        + "\" is not a valid model id for Ollama.");
+        List<String> serverIds = cachedLocalModelIdsFromServer;
+        if (serverIds == null || serverIds.isEmpty()) {
+            serverIds = fetchLocalOpenAiModelsList();
+        }
+        if (serverIds != null && !serverIds.isEmpty() && !isLocalModelIdOnServer(resolved, serverIds)) {
+            String fallback = serverIds.get(0);
+            log("Local model \"" + resolved + "\" is not in GET /v1/models; using \"" + fallback + "\" instead.",
+                    LogCategory.GENERAL);
+            return fallback;
+        }
+        return resolved;
     }
 
     /**
@@ -3420,16 +5194,16 @@ private void createMainTab() {
                 break;
 
             case "local":
-				url = new URL(localEndpointField.getText() + "/chat/completions");
+				url = new URL(normalizeLocalLlmBaseUrl() + "/chat/completions");
                 String localModelForApi = resolveOpenAiCompatibleLocalModelId(modelNameForApi);
 			    jsonBody.put("model", localModelForApi)
 			            .put("temperature", 0.7)
-
-
+                        .put("stream", false)
                         .put("messages", new JSONArray()
                                 .put(new JSONObject()
                                         .put("role", "user")
                                         .put("content", finalPrompt)));
+                log("Local LLM chat URL=" + url + " model=" + localModelForApi, LogCategory.GENERAL);
                 break;
 
             default:
@@ -4052,6 +5826,10 @@ private String extractFirstJsonObjectText(String text) {
 
 
 private String extractContentFromResponse(JSONObject response, String model) {
+    return extractContentFromResponse(response, model, true);
+}
+
+private String extractContentFromResponse(JSONObject response, String model, boolean stripNewlines) {
     try {
         String[] modelParts = model.split("/",2);
         String provider;
@@ -4127,7 +5905,7 @@ private String extractContentFromResponse(JSONObject response, String model) {
 					JSONObject message = choice.optJSONObject("message");
 					if (message != null) {
 						// return message.optString("content");
-						return cleanLLMResponse(message.optString("content"), true);
+						return cleanLLMResponse(message.optString("content"), stripNewlines);
 					}
 				}
 				break;
@@ -4454,17 +6232,19 @@ private String getNextGeminiApiKey(boolean cycle) {
             if (pl.endsWith(".png") || pl.endsWith(".jpg") || pl.endsWith(".jpeg") || pl.endsWith(".gif")
                     || pl.endsWith(".webp") || pl.endsWith(".ico") || pl.endsWith(".woff") || pl.endsWith(".woff2")
                     || pl.endsWith(".ttf") || pl.endsWith(".eot") || pl.endsWith(".mp4") || pl.endsWith(".mp3")
-                    || pl.endsWith(".pdf") || pl.endsWith(".zip")) {
+                    || pl.endsWith(".pdf") || pl.endsWith(".zip") || pl.endsWith(".css") || pl.endsWith(".map")
+                    || pl.endsWith(".js") || pl.endsWith(".mjs") || pl.endsWith(".cjs")) {
                 return false;
             }
         }
         String ct = passiveContentTypeLower(res);
         if (ct.contains("image/") || ct.contains("font/") || ct.contains("video/") || ct.contains("audio/")
-                || ct.contains("application/octet-stream")) {
+                || ct.contains("application/octet-stream") || ct.contains("javascript") || ct.contains("ecmascript")
+                || ct.contains("text/css")) {
             return false;
         }
-        if (ct.contains("json") || ct.contains("html") || ct.contains("javascript") || ct.contains("xml")
-                || ct.contains("text/") || ct.contains("application/ecmascript")) {
+        if (ct.contains("json") || ct.contains("html") || ct.contains("xml")
+                || ct.contains("text/")) {
             return true;
         }
         return ct.isEmpty() && res.body().length() <= 64 * 1024 && passiveBodyLooksTextual(res);
@@ -4649,6 +6429,19 @@ private String getNextGeminiApiKey(boolean cycle) {
     }
 
     /**
+     * Limit automatic Proxy LLM audits so a busy site cannot flood Burp's EDT / local model.
+     */
+    private boolean allowAnotherProxyAiAudit() {
+        long now = System.currentTimeMillis();
+        long start = proxyAiWindowStartMs;
+        if (now - start > PROXY_AI_WINDOW_MS) {
+            proxyAiWindowStartMs = now;
+            proxyAiWindowCount.set(0);
+        }
+        return proxyAiWindowCount.incrementAndGet() <= PROXY_AI_MAX_PER_WINDOW;
+    }
+
+    /**
      * EDT: invoked after {@link HttpHandler} sees Proxy traffic; skips unless local model + endpoint are configured.
      */
     private void considerQueueProxyBrowserAiAudit(HttpRequestResponse rr) {
@@ -4669,6 +6462,9 @@ private String getNextGeminiApiKey(boolean cycle) {
             return;
         }
         if (!shouldScheduleAiTrafficContentFilters(rr, false)) {
+            return;
+        }
+        if (!allowAnotherProxyAiAudit()) {
             return;
         }
         String dedupKey = auditDedupKeyHostPath(req);
@@ -4693,14 +6489,11 @@ private String getNextGeminiApiKey(boolean cycle) {
         if (isExtensionGeneratedIssue(issue)) {
             return;
         }
-        List<HttpRequestResponse> rrs = issue.requestResponses();
-        if (rrs == null || rrs.isEmpty()) {
+        List<HttpRequestResponse> rrs = resolveTrafficForIssue(issue);
+        if (rrs.isEmpty()) {
             return;
         }
         for (HttpRequestResponse rr : rrs) {
-            if (rr == null || rr.request() == null) {
-                continue;
-            }
             HttpRequest req = rr.request();
             if (passiveAiInScopeOnly && !api.scope().isInScope(req.url())) {
                 continue;

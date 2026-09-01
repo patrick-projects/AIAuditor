@@ -22,6 +22,7 @@
  import burp.api.montoya.collaborator.Interaction;
  import burp.api.montoya.http.HttpService;
  import burp.api.montoya.http.message.HttpRequestResponse;
+ import burp.api.montoya.http.message.requests.HttpRequest;
  import burp.api.montoya.scanner.audit.issues.AuditIssue;
  import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence;
  import burp.api.montoya.scanner.audit.issues.AuditIssueDefinition;
@@ -57,9 +58,8 @@
 		this.confidence = builder.confidence;
 
 		if (builder.requestResponses == null || builder.requestResponses.isEmpty()) {
-			// Fallback: keep Burp alive but the issue will not show a request tab
 			this.requestResponses = Collections.emptyList();
-			this.httpService      = null;
+			this.httpService = resolveHttpServiceFromEndpoint(builder.endpoint);
 		} else {
 			this.requestResponses = builder.requestResponses;
 			this.httpService      = builder.requestResponses.get(0).httpService();
@@ -67,6 +67,17 @@
 
 		this.modelUsed = builder.modelUsed;
      }
+
+	private static HttpService resolveHttpServiceFromEndpoint(String endpoint) {
+		if (endpoint == null || endpoint.isEmpty() || "unknown".equals(endpoint)) {
+			return null;
+		}
+		try {
+			return HttpRequest.httpRequestFromUrl(endpoint).httpService();
+		} catch (Exception e) {
+			return null;
+		}
+	}
  
  
 	/** Converts a limited Markdown subset (bold, italic, newlines) to HTML. */
